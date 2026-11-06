@@ -8,6 +8,7 @@
 
 extern "C" {
 #include "functions.h"
+#include "include/macros.h" // ComboShip: CUR_UPG_VALUE for the single-arrow case below
 extern PlayState* gPlayState;
 }
 
@@ -57,6 +58,14 @@ void Anchor::SendPacket_GiveItem(u16 modId, s16 getItemId) {
     SendJsonToRemote(payload);
 #ifdef COMBO_BUILD
     SPDLOG_INFO("[Anchor] GIVE_ITEM sent: modId={} getItemId={}", modId, getItemId);
+    // ComboShip: live partner feed (Anchor.cpp) so a teammate in MM sees this OOT find. Rando items only
+    // (MOD_NONE GIVE_ITEMs in a rando save are drops/ammo), never junk, never ice traps.
+    if (modId == MOD_RANDOMIZER && getItemId != RG_ICE_TRAP && getItemId > RG_NONE && getItemId < RG_MAX) {
+        auto& item = Rando::StaticData::RetrieveItem(static_cast<RandomizerGet>(getItemId));
+        if (item.GetGIEntry_Copy().getItemCategory != ITEM_CATEGORY_JUNK) {
+            Anchor_SendPartnerFind(item.GetName().english, "oot", "item");
+        }
+    }
 #endif
 }
 
@@ -89,6 +98,23 @@ void Anchor::HandlePacket_GiveItem(nlohmann::json payload) {
     } else {
         getItemEntry = Rando::StaticData::RetrieveItem(static_cast<RandomizerGet>(getItemId)).GetGIEntry_Copy();
     }
+
+#ifdef COMBO_BUILD
+    // ComboShip: EnItem00's single-arrow drop grants via Item_Give(ITEM_BOW) (z_en_item00.c), which
+    // Return_Item maps to GI_BOW — so ONE arrow picked up by a teammate arrives here as a vanilla Bow
+    // (ITEM_CATEGORY_MAJOR: "found Fairy Bow" toast, and a bow-less receiver would get Bow + quiver).
+    // ComboShip is always rando, where the real Bow is RG_FAIRY_BOW (MOD_RANDOMIZER), so a MOD_NONE
+    // GI_BOW is always that single arrow: apply +1 arrow only, never the Bow, and stay silent.
+    if (IS_RANDO && modId == MOD_NONE && getItemId == GI_BOW) {
+        if (CUR_UPG_VALUE(UPG_QUIVER) > 0) {
+            Item_Give(gPlayState, ITEM_BOW); // quiver owned: AMMO(ITEM_BOW)++ capped (z_parameter.c)
+            if (isDormantApply) {
+                dormantDidApply = true;
+            }
+        }
+        return;
+    }
+#endif
 
     if (getItemEntry.modIndex == MOD_NONE) {
         if (getItemEntry.getItemId == GI_SWORD_BGS) {

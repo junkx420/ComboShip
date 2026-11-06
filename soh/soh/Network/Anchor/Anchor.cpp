@@ -45,6 +45,9 @@ extern "C" void Anchor_BroadcastCrossItem(int targetGame, const char* itemName, 
     payload["itemName"] = itemName;     // neutral CrossForeign name, in the target game's namespace
     payload["srcCheckName"] = srcCheckName;
     Anchor::Instance->SendJsonToRemote(payload);
+    // Live partner feed: a teammate currently in OOT gets this item silently into their dormant MM.
+    // (Declared in Anchor.h.)
+    Anchor_SendPartnerFind(itemName, targetGame == 1 ? "mm" : "oot", "cross");
 }
 
 // Apply a cross-game item received from a teammate. Routes through the launcher (DeliverCrossItem),
@@ -85,6 +88,54 @@ static void Anchor_HandleCrossItemPacket(const nlohmann::json& payload) {
         }
         Notification::Emit({ .message = "Received:", .suffix = name });
     }
+}
+
+// Live partner feed (2026-11-07): one informational COMBO_PARTNER_FIND per notable find, so a teammate
+// sees it even when the item lands silently in their OTHER (dormant) game. Shared with MMAnchor, which
+// speaks the same shape. Never queued server-side (no addToQueue): a late joiner gets no stale burst.
+// Display only — it grants nothing, so it can't loop or double-grant.
+static const std::string COMBO_PARTNER_FIND = "COMBO_PARTNER_FIND";
+
+void Anchor_SendPartnerFind(const std::string& itemName, const char* itemGame, const char* kind) {
+    if (!Anchor::Instance || !Anchor::Instance->isConnected || itemName.empty()) {
+        return;
+    }
+    nlohmann::json payload;
+    payload["type"] = COMBO_PARTNER_FIND;
+    payload["targetTeamId"] = CVarGetString(CVAR_REMOTE_ANCHOR("TeamId"), "default");
+    payload["itemName"] = itemName;
+    payload["itemGame"] = itemGame;
+    payload["kind"] = kind;
+    payload["quiet"] = true;
+    Anchor::Instance->SendJsonToRemote(payload);
+}
+
+// Runs only while OOT is the active game (PumpDormant drops unknown types). Shows exactly the finds no
+// other OOT toast covers: same-game OOT finds already toast in HandlePacket_GiveItem, and cross items
+// for OOT already toast "Received:" in Anchor_HandleCrossItemPacket.
+static void Anchor_HandlePartnerFindPacket(const nlohmann::json& payload) {
+    Anchor* anchor = Anchor::Instance;
+    uint32_t clientId = payload.value("clientId", (uint32_t)0);
+    if (!anchor || clientId == anchor->ownClientId) {
+        return;
+    }
+    if (payload.value("targetTeamId", std::string("default")) !=
+        CVarGetString(CVAR_REMOTE_ANCHOR("TeamId"), "default")) {
+        return;
+    }
+    std::string itemName = payload.value("itemName", std::string());
+    std::string kind = payload.value("kind", std::string("item"));
+    bool show = kind == "cross" ? payload.value("itemGame", std::string()) == "mm"
+                                : payload.value("originGame", std::string("oot")) == "mm";
+    if (itemName.empty() || !show) {
+        return;
+    }
+    std::string who = "Teammate";
+    auto it = anchor->clients.find(clientId);
+    if (it != anchor->clients.end() && !it->second.name.empty()) {
+        who = it->second.name;
+    }
+    Notification::Emit({ .prefix = who, .message = "found", .suffix = itemName + " (MM)" });
 }
 #endif
 
@@ -188,8 +239,9 @@ void Anchor::OnIncomingJson(nlohmann::json payload) {
     // ComboShip: drop MM-originated packets — their shapes collide with ours (e.g. MM's
     // UPDATE_TEAM_STATE lacks healthCapacity and throws in from_json). Exceptions: cross-game item
     // delivery and the room roster. Packets without originGame (server, old clients) pass through.
+    // (2026-11-07) COMBO_PARTNER_FIND is display-only and its MM-origin copies are the point of it.
     if (payload.value("originGame", "oot") != "oot" && packetType != COMBO_CROSS_ITEM &&
-        packetType != UPDATE_CLIENT_STATE) {
+        packetType != UPDATE_CLIENT_STATE && packetType != COMBO_PARTNER_FIND) {
         return;
     }
 #endif
@@ -247,6 +299,8 @@ void Anchor::ProcessIncomingPacketQueue() {
 #ifdef COMBO_BUILD
             else if (packetType == COMBO_CROSS_ITEM)
                 Anchor_HandleCrossItemPacket(payload);
+            else if (packetType == COMBO_PARTNER_FIND)
+                Anchor_HandlePartnerFindPacket(payload);
 #endif
             else if (packetType == OCARINA_SFX)
                 HandlePacket_OcarinaSfx(payload);
@@ -333,6 +387,38 @@ void Anchor::PumpDormant() {
                 HandlePacket_UpdateTeamState(payload);
             } catch (const std::exception& e) { SPDLOG_ERROR("[Anchor] dormant team-state apply: {}", e.what()); }
             isDormantApply = false;
+            continue;
+        }
+        if (type == SET_FLAG || type == UNSET_FLAG || type == SET_CHECK_STATUS || type == UPDATE_DUNGEON_ITEMS ||
+            type == UPDATE_BEANS_COUNT || type == ENTRANCE_DISCOVERED) {
+            // ComboShip (2026-11-07): background world sync. These used to be dropped here, so a teammate's
+            // OOT chests/flags/tracker/entrances/keys only reached a client playing MM on the teammate's
+            // next save (UPDATE_TEAM_STATE) — switching to OOT before that meant closed chests and a
+            // double grant. All six are save-only writes; the flag and check-status handlers take a
+            // dormant branch (no gPlayState, no live-play tracker recalcs). isProcessingIncomingPacket
+            // keeps any hook they fire from re-broadcasting.
+            isProcessingIncomingPacket = true;
+            isDormantApply = true;
+            try {
+                if (roomState.syncItemsAndFlags && IsSaveLoaded()) {
+                    if (type == SET_FLAG) {
+                        HandlePacket_SetFlag(payload);
+                    } else if (type == UNSET_FLAG) {
+                        HandlePacket_UnsetFlag(payload);
+                    } else if (type == SET_CHECK_STATUS) {
+                        HandlePacket_SetCheckStatus(payload);
+                    } else if (type == UPDATE_DUNGEON_ITEMS) {
+                        HandlePacket_UpdateDungeonItems(payload);
+                    } else if (type == UPDATE_BEANS_COUNT) {
+                        HandlePacket_UpdateBeansCount(payload);
+                    } else {
+                        HandlePacket_EntranceDiscovered(payload);
+                    }
+                    dormantDidApply = true;
+                }
+            } catch (const std::exception& e) { SPDLOG_ERROR("[Anchor] dormant {} apply: {}", type, e.what()); }
+            isDormantApply = false;
+            isProcessingIncomingPacket = false;
             continue;
         }
         if (type != GIVE_ITEM) {

@@ -44,6 +44,9 @@ static const std::string PKT_REQUEST_TEAM_STATE = "REQUEST_TEAM_STATE";
 // Issue #3: cross-game item delivery. ComboShip-private packet type (the public server relays unknown
 // types peer-to-peer, so no server change is needed).
 static const std::string PKT_CROSS_ITEM = "COMBO_CROSS_ITEM";
+// Live partner feed (2026-11-07): display-only, shared with soh's Anchor (Anchor.cpp). Passes the
+// origin filter in both directions, since showing the OTHER game's finds is the point of it.
+static const std::string PKT_PARTNER_FIND = "COMBO_PARTNER_FIND";
 // Same-game teleport. Same wire strings as soh's Anchor; MM-origin so soh clients drop them.
 static const std::string PKT_REQUEST_TELEPORT = "REQUEST_TELEPORT";
 static const std::string PKT_TELEPORT_TO = "TELEPORT_TO";
@@ -210,7 +213,8 @@ void MMAnchor::OnIncomingJson(const std::string& payload) {
     // Drop OOT-originated packets — their shapes collide with ours (GIVE_ITEM, UPDATE_TEAM_STATE...).
     // Exceptions: cross-game item delivery and the room roster. No originGame (server) passes through.
     std::string type = j["type"].get<std::string>();
-    if (j.value("originGame", "mm") != "mm" && type != PKT_CROSS_ITEM && type != PKT_UPDATE_CLIENT_STATE) {
+    if (j.value("originGame", "mm") != "mm" && type != PKT_CROSS_ITEM && type != PKT_UPDATE_CLIENT_STATE &&
+        type != PKT_PARTNER_FIND) {
         return;
     }
     std::lock_guard<std::mutex> lock(incomingMutex);
@@ -240,6 +244,8 @@ void MMAnchor::ProcessIncomingPacketQueue() {
                 HandlePacket_GiveItem(payload);
             } else if (type == PKT_CROSS_ITEM) {
                 HandlePacket_CrossItem(payload);
+            } else if (type == PKT_PARTNER_FIND) {
+                HandlePacket_PartnerFind(payload);
             } else if (type == PKT_UPDATE_TEAM_STATE) {
                 HandlePacket_UpdateTeamState(payload);
             } else if (type == PKT_REQUEST_TEAM_STATE) {
@@ -581,6 +587,52 @@ void MMAnchor::SendPacket_GiveItem(int16_t randoItemId, int32_t randoCheckId) {
     payload["randoCheckId"] = randoCheckId; // so receivers can mark the check obtained (no double-collect)
     SendJson(payload);
     SPDLOG_INFO("[MMAnchor] GIVE_ITEM sent: check={} item={}", randoCheckId, randoItemId);
+
+    // ComboShip: live partner feed — MM's GIVE_ITEM receive is silent, and a teammate in OOT would never
+    // see this find at all. Non-junk only; the name is the RAW item's (progressive items read as such).
+    auto it = Rando::StaticData::Items.find((RandoItemId)randoItemId);
+    if (it != Rando::StaticData::Items.end() && it->second.randoItemType != RITYPE_JUNK && it->second.name) {
+        SendPacket_PartnerFind(it->second.name, "mm", "item");
+    }
+}
+
+void MMAnchor::SendPacket_PartnerFind(const std::string& itemName, const char* itemGame, const char* kind) {
+    if (!isActive || itemName.empty()) {
+        return;
+    }
+    nlohmann::json payload;
+    payload["type"] = PKT_PARTNER_FIND;
+    payload["targetTeamId"] = CVarGetString(kCvarTeamId, "default");
+    payload["itemName"] = itemName;
+    payload["itemGame"] = itemGame;
+    payload["kind"] = kind;
+    payload["quiet"] = true; // never addToQueue: a late joiner shouldn't get a burst of stale toasts
+    SendJson(payload);
+}
+
+// Runs only while MM is the active game (PumpDormant drops this type). Shows every teammate find no
+// other MM toast covers: same-game MM GIVE_ITEMs apply silently, OOT finds never reach MM otherwise,
+// and cross items for MM already toast "Received:" in HandlePacket_CrossItem.
+void MMAnchor::HandlePacket_PartnerFind(const nlohmann::json& payload) {
+    uint32_t clientId = payload.value("clientId", (uint32_t)0);
+    if (clientId == ownClientId) {
+        return;
+    }
+    if (payload.value("targetTeamId", std::string("default")) != CVarGetString(kCvarTeamId, "default")) {
+        return;
+    }
+    std::string itemName = payload.value("itemName", std::string());
+    std::string kind = payload.value("kind", std::string("item"));
+    if (itemName.empty() || (kind == "cross" && payload.value("itemGame", std::string()) != "oot")) {
+        return;
+    }
+    bool otherGame = kind == "cross" || payload.value("originGame", std::string("mm")) == "oot";
+    std::string who = "Teammate";
+    auto it = clients.find(clientId);
+    if (it != clients.end() && !it->second.name.empty() && it->second.name != "???") {
+        who = it->second.name;
+    }
+    Notification::Emit({ .prefix = who, .message = "found", .suffix = otherGame ? itemName + " (OoT)" : itemName });
 }
 
 void MMAnchor::HandlePacket_GiveItem(const nlohmann::json& payload) {
@@ -693,6 +745,10 @@ void MMAnchor::HandlePacket_CrossItem(const nlohmann::json& payload) {
 extern "C" void MMAnchor_BroadcastCrossItem(int targetGame, const char* itemName, const char* srcCheckName) {
     if (MMAnchor::Instance && MMAnchor::Instance->isActive) {
         MMAnchor::Instance->SendPacket_CrossItem(targetGame, itemName, srcCheckName);
+        // Live partner feed: a teammate currently in MM gets this item silently into their dormant OOT.
+        if (itemName) {
+            MMAnchor::Instance->SendPacket_PartnerFind(itemName, targetGame == 0 ? "oot" : "mm", "cross");
+        }
     }
 }
 

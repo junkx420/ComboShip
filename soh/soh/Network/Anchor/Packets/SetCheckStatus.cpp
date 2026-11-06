@@ -57,7 +57,15 @@ void Anchor::HandlePacket_SetCheckStatus(nlohmann::json payload) {
         randoContext->GetItemLocation(rc)->SetIsSkipped(skipped);
     }
 
+#ifdef COMBO_BUILD
+    // ComboShip: background world sync — while OOT is dormant only the status itself is stored (it is
+    // persisted with the save). The tracker recalcs evaluate logic against live play state, which does
+    // not exist then; they rerun on the next foreground status change / file load.
+    if (!isDormantApply)
+#endif
+    {
     CheckTracker::RecalculateAllAreaTotals();
     CheckTracker::RecalculateAvailableChecks();
+    }
     isResultOfHandling = false;
 }

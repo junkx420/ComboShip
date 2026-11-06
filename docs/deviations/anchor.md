@@ -346,3 +346,70 @@ on `HasLoadedRandoSave` ("don't ask for a state we can't consume"). Left unchang
 sequence and this fix's own playtest table depend on the dormant boot-time resync *request* still going
 out while no slot is loaded yet (that's what proves the refusal path works); it's the *reply* that's now
 correctly refused by `HandlePacket_UpdateTeamState`'s `HasLoadedRandoSave` guard.
+
+## OOT co-op sync audit: flag echo, effect leak, single-arrow-as-Bow (2026-11-07)
+
+**Why:** audit of the same-game shared-progression sync (OOT↔OOT over Anchor). Item sync
+(`OnItemReceive` → `GIVE_ITEM`, which every `Item_Give`/`Randomizer_Item_Give` reaches via
+`Return_Item_Entry`, including `EnItem00` rupee/ammo/heart drops), world-flag sync (`OnSceneFlagSet`/
+`OnFlagSet` → `SET_FLAG`/`UNSET_FLAG`) and same-room chest state (`EnBox_WaitOpen` already switches to
+`EnBox_Open` once the treasure flag is set) all exist upstream. Three defects remained.
+
+Fixes, all `COMBO_BUILD`, no wire change:
+- `soh/soh/Network/Anchor/Packets/SetFlag.cpp` / `UnsetFlag.cpp` (`SendPacket_*`): skip while
+  `isProcessingIncomingPacket`, like `GIVE_ITEM`/`ENTRANCE_DISCOVERED` already did. A flag set as a side
+  effect of applying a remote packet (e.g. `Randomizer_Item_Give` inside `HandlePacket_GiveItem`) was
+  echoed back to the whole team — one redundant hop per receiver, O(N²) packets per flag. Terminating
+  before (the `RawAction` apply path writes flags directly and fires no hook) but wasteful.
+- Same files (`HandlePacket_*`): `delete` the `GameInteractionEffect` after its synchronous `Apply()`;
+  upstream `new`-ed one per received flag packet and never freed it.
+- `soh/soh/Network/Anchor/Packets/GiveItem.cpp` (`HandlePacket_GiveItem`): `EnItem00`'s single-arrow drop
+  grants `Item_Give(ITEM_BOW)`, which `Return_Item` maps to `GI_BOW`, so one arrow arrived at teammates
+  as a vanilla Bow — a `ITEM_CATEGORY_MAJOR` "found Fairy Bow" toast per arrow, and a bow-less receiver
+  would have been granted Bow + quiver outside the seed. ComboShip is always rando (real Bow is
+  `RG_FAIRY_BOW`, `MOD_RANDOMIZER`), so a `MOD_NONE` `GI_BOW` is treated as +1 arrow when a quiver is
+  owned, dropped otherwise, never toasted.
+
+Known remaining gaps (not changed): `ITEM00_FLEXIBLE` heals via `Health_ChangeBy` and is not shared;
+direct `Rupees_ChangeBy` rewards outside `Item_Give` are not shared; while OOT is dormant,
+`PumpDormant` drops `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS` and relies on the next
+`UPDATE_TEAM_STATE` resync; MM still has no flag sync (Phase 2c).
+
+## Split-game co-op: background world sync + live partner feed (2026-11-07)
+
+**Why:** the common combo co-op shape is one player mostly in OOT and the other mostly in MM, switching
+when a game runs dry. Two gaps made that feel disconnected: (1) a client whose OOT was dormant dropped
+the teammate's `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS`/`UPDATE_DUNGEON_ITEMS`/`UPDATE_BEANS_COUNT`/
+`ENTRANCE_DISCOVERED` — only the item arrived, the world state waited for the teammate's next save
+(`UPDATE_TEAM_STATE`), so switching to OOT before that showed closed chests and allowed a double grant;
+(2) every "teammate found X" toast was suppressed for the game you are *not* in, and MM's same-game
+`GIVE_ITEM` receive never toasted at all.
+
+**Background world sync** (all `COMBO_BUILD`, no wire change):
+- `soh/soh/Network/Anchor/Anchor.cpp` (`PumpDormant`): applies those six packet types to the resident
+  save under `isDormantApply` + `isProcessingIncomingPacket` (so hooks they fire can't re-broadcast) and
+  persists via the existing `dormantDidApply` save.
+- `Packets/SetFlag.cpp` / `UnsetFlag.cpp`: a dormant branch. `GameInteractionEffect::*` refuses without
+  `gPlayState` and `RawAction::SetSceneFlag` dereferences `gPlayState->sceneNum`, so scene flags go
+  through the new `Anchor_DormantWriteSceneFlag` (save half of `RawAction::SetSceneFlag`: switch flags
+  `>= 0x20` and collectible flag 0 are temp/unsaved and skipped) and global flags through
+  `RawAction::SetFlag`/`UnsetFlag` (save-only already). The item swaps (Ruto's Letter, adult trade) use
+  `Anchor_DormantReplaceItem` = `Inventory_ReplaceItem` minus its `Interface_LoadItemIcon1(play, ...)`.
+  Both helpers are declared in `Anchor.h`. Valid because while OOT is dormant the save copy of the scene
+  flags is authoritative (`UpdateTeamState.cpp` already relies on this).
+- `Packets/SetCheckStatus.cpp`: while dormant only the status is stored; the tracker recalcs (logic
+  evaluation) are skipped and rerun on the next foreground change / file load.
+
+**Live partner feed** — new display-only packet `COMBO_PARTNER_FIND` {`itemName`, `itemGame`
+(`"oot"`/`"mm"`, the item's home game), `kind` (`"item"`/`"cross"`)}, never `addToQueue`d:
+- Sent by OOT from `SendPacket_GiveItem` (rando, non-junk, non-ice-trap) and `Anchor_BroadcastCrossItem`;
+  by MM from `MMAnchor::SendPacket_GiveItem` (non-`RITYPE_JUNK`, raw item name) and
+  `MMAnchor_BroadcastCrossItem`.
+- Both origin filters (`Anchor::OnIncomingJson`, `MMAnchor::OnIncomingJson`) let it through. Handled only
+  by the foreground game; both `PumpDormant`s drop it.
+- Shown only where no existing toast covers it. OOT: `kind=item` from MM origin, or `kind=cross` with
+  `itemGame=mm`. MM: every `kind=item` (MM's own receive is silent), or `kind=cross` with `itemGame=oot`.
+  Suffix `(MM)`/`(OoT)` marks the other game. Own `clientId` and other teams are ignored.
+
+Not covered: foreign traps are announced under their raw cross name; the dormant OOT check-tracker
+area totals refresh only once OOT is foreground again.

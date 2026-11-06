@@ -8,6 +8,65 @@ extern "C" {
 extern PlayState* gPlayState;
 }
 
+#ifdef COMBO_BUILD
+#include "soh/Enhancements/game-interactor/GameInteractor.h"
+extern "C" {
+#include "include/macros.h" // ARRAY_COUNT
+}
+
+// ComboShip: background world sync (2026-11-07) — dormant-safe save writes, used by SET_FLAG/UNSET_FLAG
+// while OOT is backgrounded (declared in Anchor.h). Mirrors the save half of
+// GameInteractor::RawAction::SetSceneFlag/UnsetSceneFlag: switch flags >= 0x20 and collectible flag 0
+// are temp/unsaved there too, so they are skipped here.
+void Anchor_DormantWriteSceneFlag(s16 sceneNum, s16 flagType, s16 flag, bool set) {
+    if (sceneNum < 0 || sceneNum >= SCENE_ID_MAX || flag < 0 || flag >= 0x20) {
+        return;
+    }
+    u32* field = nullptr;
+    switch (flagType) {
+        case FLAG_SCENE_SWITCH:
+            field = &gSaveContext.sceneFlags[sceneNum].swch;
+            break;
+        case FLAG_SCENE_CLEAR:
+            field = &gSaveContext.sceneFlags[sceneNum].clear;
+            break;
+        case FLAG_SCENE_TREASURE:
+            field = &gSaveContext.sceneFlags[sceneNum].chest;
+            break;
+        case FLAG_SCENE_COLLECTIBLE:
+            if (flag == 0) {
+                return;
+            }
+            field = &gSaveContext.sceneFlags[sceneNum].collect;
+            break;
+        default:
+            return;
+    }
+    if (set) {
+        *field |= (1u << flag);
+    } else {
+        *field &= ~(1u << flag);
+    }
+}
+
+// Inventory_ReplaceItem minus its Interface_LoadItemIcon1(play, ...) — play is null while dormant, and
+// the C-button icons are reloaded on the next scene load anyway.
+void Anchor_DormantReplaceItem(u16 oldItem, u16 newItem) {
+    for (size_t i = 0; i < ARRAY_COUNT(gSaveContext.inventory.items); i++) {
+        if (gSaveContext.inventory.items[i] == oldItem) {
+            gSaveContext.inventory.items[i] = newItem;
+            for (size_t b = 1; b < ARRAY_COUNT(gSaveContext.equips.buttonItems); b++) {
+                if (gSaveContext.equips.buttonItems[b] == oldItem) {
+                    gSaveContext.equips.buttonItems[b] = newItem;
+                    break;
+                }
+            }
+            return;
+        }
+    }
+}
+#endif
+
 /**
  * SET_FLAG
  *
@@ -18,6 +77,15 @@ void Anchor::SendPacket_SetFlag(s16 sceneNum, s16 flagType, s16 flag) {
     if (!IsSaveLoaded() || !roomState.syncItemsAndFlags) {
         return;
     }
+#ifdef COMBO_BUILD
+    // ComboShip: loop prevention. A flag set as a side effect of applying a remote packet (e.g.
+    // Randomizer_Item_Give setting a RAND_INF inside HandlePacket_GiveItem) fires OnFlagSet, which
+    // would echo it back to the team. Every teammate already derives it from the same packet, and the
+    // original sender broadcasts it from its own local grant — same guard GIVE_ITEM/ENTRANCE_DISCOVERED use.
+    if (isProcessingIncomingPacket) {
+        return;
+    }
+#endif
 
     nlohmann::json payload;
     payload["type"] = SET_FLAG;
@@ -47,10 +115,25 @@ void Anchor::HandlePacket_SetFlag(nlohmann::json payload) {
     }
 
     if (sceneNum == SCENE_ID_MAX) {
+#ifdef COMBO_BUILD
+        // ComboShip: background world sync — the effect refuses without gPlayState, so write the save
+        // directly (RawAction::SetFlag touches only gSaveContext) and skip the HUD icon reload.
+        if (isDormantApply) {
+            GameInteractor::RawAction::SetFlag(flagType, flag);
+            if (flagType == FLAG_EVENT_CHECK_INF && flag == EVENTCHKINF_KING_ZORA_MOVED &&
+                Inventory_HasSpecificBottle(ITEM_LETTER_RUTO)) {
+                Anchor_DormantReplaceItem(ITEM_LETTER_RUTO, ITEM_BOTTLE);
+            }
+            return;
+        }
+#endif
         auto effect = new GameInteractionEffect::SetFlag();
         effect->parameters[0] = flagType;
         effect->parameters[1] = flag;
         effect->Apply();
+#ifdef COMBO_BUILD
+        delete effect; // ComboShip: Apply() is synchronous and nothing keeps the effect; upstream leaked it per packet.
+#endif
 
         // Special case: If King Zora moved, and the player has Ruto's Letter, convert it to an empty bottle
         if (flagType == FLAG_EVENT_CHECK_INF && flag == EVENTCHKINF_KING_ZORA_MOVED &&
@@ -80,10 +163,21 @@ void Anchor::HandlePacket_SetFlag(nlohmann::json payload) {
             return;
         }
 
+#ifdef COMBO_BUILD
+        // ComboShip: background world sync — RawAction::SetSceneFlag reads gPlayState->sceneNum (null
+        // while dormant). The save copy is authoritative while OOT is backgrounded, so write it directly.
+        if (isDormantApply) {
+            Anchor_DormantWriteSceneFlag(sceneNum, flagType, flag, true);
+            return;
+        }
+#endif
         auto effect = new GameInteractionEffect::SetSceneFlag();
         effect->parameters[0] = sceneNum;
         effect->parameters[1] = flagType;
         effect->parameters[2] = flag;
         effect->Apply();
+#ifdef COMBO_BUILD
+        delete effect; // ComboShip: see above.
+#endif
     }
 }

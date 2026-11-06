@@ -98,6 +98,9 @@ class MMAnchor {
     // Issue #3: cross-game item delivery. Broadcast a locally-collected foreign item to teammates so
     // their TARGET game's save receives it; receivers route through the launcher's DeliverCrossItem.
     void SendPacket_CrossItem(int targetGame, const char* itemName, const char* srcCheckName);
+    // ComboShip: live partner feed (2026-11-07). Display-only COMBO_PARTNER_FIND, same shape as soh's
+    // Anchor_SendPartnerFind: itemGame = item's home game ("oot"/"mm"), kind = "item" | "cross".
+    void SendPacket_PartnerFind(const std::string& itemName, const char* itemGame, const char* kind);
     // Phase 2d: late-join / reconnect resync. Mirrors the canonical UPDATE_TEAM_STATE: push the whole
     // Save to teammates; on receive, commit saveInfo + shipSaveInfo (top-level Save fields like
     // scene/time/form are left untouched so the receiver isn't teleported).
@@ -143,6 +146,7 @@ class MMAnchor {
     void HandlePacket_DamagePlayer(const nlohmann::json& payload);
     void HandlePacket_GiveItem(const nlohmann::json& payload);
     void HandlePacket_CrossItem(const nlohmann::json& payload); // issue #3 cross-game delivery
+    void HandlePacket_PartnerFind(const nlohmann::json& payload); // live partner feed (toast only)
     void ApplyDormantGiveItem(const nlohmann::json& payload);   // A6: dormant-safe co-op item apply
     void HandlePacket_UpdateTeamState(nlohmann::json& payload); // mutates payload (rando check unpack)
     void HandlePacket_RequestTeamState(const nlohmann::json& payload);

@@ -2,6 +2,9 @@
 
 #include "soh/Network/Anchor/Anchor.h"
 #include "soh/Enhancements/game-interactor/GameInteractionEffect.h"
+#ifdef COMBO_BUILD
+#include "soh/Enhancements/game-interactor/GameInteractor.h" // ComboShip: RawAction for the dormant path
+#endif
 
 extern "C" {
 #include "functions.h"
@@ -19,6 +22,12 @@ void Anchor::SendPacket_UnsetFlag(s16 sceneNum, s16 flagType, s16 flag) {
     if (!IsSaveLoaded() || !roomState.syncItemsAndFlags) {
         return;
     }
+#ifdef COMBO_BUILD
+    // ComboShip: loop prevention — don't echo unsets caused by applying a remote packet (see SetFlag.cpp).
+    if (isProcessingIncomingPacket) {
+        return;
+    }
+#endif
 
     nlohmann::json payload;
     payload["type"] = UNSET_FLAG;
@@ -48,10 +57,21 @@ void Anchor::HandlePacket_UnsetFlag(nlohmann::json payload) {
     }
 
     if (sceneNum == SCENE_ID_MAX) {
+#ifdef COMBO_BUILD
+        // ComboShip: background world sync — direct save write while dormant (see SetFlag.cpp).
+        if (isDormantApply) {
+            GameInteractor::RawAction::UnsetFlag(flagType, flag);
+        } else
+#endif
+        {
         auto effect = new GameInteractionEffect::UnsetFlag();
         effect->parameters[0] = flagType;
         effect->parameters[1] = flag;
         effect->Apply();
+#ifdef COMBO_BUILD
+        delete effect; // ComboShip: Apply() is synchronous and nothing keeps the effect; upstream leaked it per packet.
+#endif
+        }
 
         // Special case: If an adult trade item flag is unset, replace the item if the player has it equipped
         if (flagType == FLAG_RANDOMIZER_INF &&
@@ -92,6 +112,11 @@ void Anchor::HandlePacket_UnsetFlag(nlohmann::json payload) {
                     itemToReplace = ITEM_CLAIM_CHECK;
                     break;
             }
+#ifdef COMBO_BUILD
+            if (isDormantApply) {
+                Anchor_DormantReplaceItem(itemToReplace, Randomizer_GetNextAdultTradeItem()); // no play → no icon reload
+            } else
+#endif
             Inventory_ReplaceItem(gPlayState, itemToReplace, Randomizer_GetNextAdultTradeItem());
         }
     } else {
@@ -106,10 +131,20 @@ void Anchor::HandlePacket_UnsetFlag(nlohmann::json payload) {
             return;
         }
 
+#ifdef COMBO_BUILD
+        // ComboShip: background world sync — RawAction::UnsetSceneFlag reads gPlayState (see SetFlag.cpp).
+        if (isDormantApply) {
+            Anchor_DormantWriteSceneFlag(sceneNum, flagType, flag, false);
+            return;
+        }
+#endif
         auto effect = new GameInteractionEffect::UnsetSceneFlag();
         effect->parameters[0] = sceneNum;
         effect->parameters[1] = flagType;
         effect->parameters[2] = flag;
         effect->Apply();
+#ifdef COMBO_BUILD
+        delete effect; // ComboShip: see above.
+#endif
     }
 }

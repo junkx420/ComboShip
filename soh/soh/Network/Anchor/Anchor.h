@@ -195,6 +195,17 @@ typedef enum {
     DUMMY_PLAYER_HIT_RESPONSE_NORMAL,
 } DummyPlayerDamageResponseType;
 
+#ifdef COMBO_BUILD
+// ComboShip: background world sync (2026-11-07). Dormant-safe save writes for PumpDormant — gPlayState
+// is null while OOT is backgrounded, so the GameInteractionEffect/RawAction scene paths can't be used.
+// Defined in Packets/SetFlag.cpp.
+void Anchor_DormantWriteSceneFlag(s16 sceneNum, s16 flagType, s16 flag, bool set);
+void Anchor_DormantReplaceItem(u16 oldItem, u16 newItem);
+// ComboShip: live partner feed (2026-11-07). itemGame = the item's home game ("oot"/"mm"), kind =
+// "item" (same-game co-op find) or "cross" (cross-game delivery). Defined in Anchor.cpp.
+void Anchor_SendPartnerFind(const std::string& itemName, const char* itemGame, const char* kind);
+#endif
+
 class AnchorRoomWindow : public Ship::GuiWindow {
   public:
     using GuiWindow::GuiWindow;
