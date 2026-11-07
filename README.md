@@ -22,6 +22,8 @@ Compared to the original ComboShip `develop` branch:
 
 - **Background world sync.** While you play MM, your teammate's OoT progress still lands in your OoT save right away: opened chests, world flags, check-tracker status, discovered entrances, dungeon keys and magic beans. When you switch to OoT, their chests are already open, so the same check can't be collected twice. (Before, this only caught up after the teammate saved.)
 - **Live partner feed.** You see what your teammate finds in the *other* game, e.g. `Teammate found Hookshot (MM)` while you are in OoT. Junk such as rupees and ammo is left out. It only shows a message and never gives items.
+- **Game-switch notice.** You get a message like `Teammate is now in Majora's Mask` whenever your teammate moves between the games.
+- **Toggles.** Both kinds of message can be turned off under Shared > Settings > Network > *Partner Feed*.
 - **Small fixes.** No echoed flag packets, a small memory leak fixed, and a teammate's single arrow no longer arrives as a "Fairy Bow".
 
 All of it lives in the Anchor networking code and is documented in [`docs/deviations/anchor.md`](docs/deviations/anchor.md). The sections dated 2026-11-07 are the ones added by this fork.
