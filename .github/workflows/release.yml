@@ -64,12 +64,25 @@ jobs:
             mv "${dmgs[0]}" "dist/ComboShip-${GITHUB_REF_NAME}-macos.dmg"
           fi
 
-      - name: Publish draft release
+      # Fan fork (junkx420): publish directly as a pre-release (this job only runs once the Windows and
+      # Linux builds succeeded), with a fork disclaimer instead of generated notes. Drop when upstreaming.
+      - name: Publish pre-release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
+          prerelease: true
           fail_on_unmatched_files: false # the DMG is absent when the macOS build failed
-          generate_release_notes: true
+          generate_release_notes: false
+          body: |
+            **Unofficial fan build. This is NOT an official ComboShip release.**
+            All credit for ComboShip goes to [Varuuna](https://github.com/Varuuna) and the contributors of
+            [ComboShip](https://github.com/Varuuna/ComboShip). This fork is not affiliated with ComboShip,
+            HarbourMasters or 2 Ship 2 Harkinian, so please report problems with this build here, not upstream.
+
+            Adds split-game Anchor co-op background sync and a live partner feed; see the README.
+            Both co-op players need this build. You need your own Ocarina of Time and Majora's Mask ROMs.
+
+            Downloads: Windows `.zip`, Linux `.AppImage` (`chmod +x` it, then run), macOS `.dmg` if that build succeeded.
           files: |
             dist/ComboShip-${{ github.ref_name }}-windows.zip
             dist/ComboShip-${{ github.ref_name }}-linux-x86_64.AppImage
