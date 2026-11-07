@@ -407,6 +407,14 @@ static void ReadClientStateInto(MMAnchorClient& c, uint32_t clientId, const nloh
     c.entrance = s.value("entrance", c.entrance);
 }
 
+// ComboShip: game a loaded client state reports (0 OOT, 1 MM), or -1 when no save is loaded.
+static int8_t ClientStateGame(const nlohmann::json& s) {
+    if (!s.value("isSaveLoaded", false)) {
+        return -1;
+    }
+    return s.value("sceneNum", 0) >= MM_ANCHOR_SCENE_NAMESPACE ? 1 : 0;
+}
+
 void MMAnchor::HandlePacket_AllClientState(const nlohmann::json& payload) {
     if (!payload.contains("state") || !payload["state"].is_array()) {
         return;
@@ -415,6 +423,9 @@ void MMAnchor::HandlePacket_AllClientState(const nlohmann::json& payload) {
         uint32_t clientId = entry.value("clientId", (uint32_t)0);
         MMAnchorClient& c = clients[clientId];
         ReadClientStateInto(c, clientId, entry);
+        if (int8_t game = ClientStateGame(entry); game != -1) {
+            c.lastGame = game; // seed only — connecting never toasts
+        }
         c.self = entry.value("self", false);
         if (c.self) {
             ownClientId = clientId;
@@ -435,6 +446,23 @@ void MMAnchor::HandlePacket_UpdateClientState(const nlohmann::json& payload) {
     }
     MMAnchorClient& c = clients[clientId];
     ReadClientStateInto(c, clientId, payload["state"]);
+
+    // ComboShip: game-switch toast (2026-11-07). A peer's two games share one clientId, so a loaded
+    // state from the other game than last time means the teammate crossed over.
+    int8_t game = ClientStateGame(payload["state"]);
+    if (game == -1) {
+        return;
+    }
+    if (c.lastGame != -1 && c.lastGame != game && !c.self && clientId != ownClientId &&
+        c.teamId == CVarGetString(kCvarTeamId, "default") &&
+        CVarGetInteger("gRemote.Anchor.PartnerFeed.GameSwitch", 1)) {
+        Notification::Emit({
+            .prefix = c.name,
+            .message = "is now in",
+            .suffix = game == 1 ? "Majora's Mask" : "Ocarina of Time",
+        });
+    }
+    c.lastGame = game;
 }
 
 // MARK: - Player update (per-frame pose; canonical field set from 2S2H PR #1349)
@@ -623,7 +651,8 @@ void MMAnchor::HandlePacket_PartnerFind(const nlohmann::json& payload) {
     }
     std::string itemName = payload.value("itemName", std::string());
     std::string kind = payload.value("kind", std::string("item"));
-    if (itemName.empty() || (kind == "cross" && payload.value("itemGame", std::string()) != "oot")) {
+    if (itemName.empty() || (kind == "cross" && payload.value("itemGame", std::string()) != "oot") ||
+        !CVarGetInteger("gRemote.Anchor.PartnerFeed.Finds", 1)) {
         return;
     }
     bool otherGame = kind == "cross" || payload.value("originGame", std::string("mm")) == "oot";

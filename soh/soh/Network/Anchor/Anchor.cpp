@@ -127,7 +127,7 @@ static void Anchor_HandlePartnerFindPacket(const nlohmann::json& payload) {
     std::string kind = payload.value("kind", std::string("item"));
     bool show = kind == "cross" ? payload.value("itemGame", std::string()) == "mm"
                                 : payload.value("originGame", std::string("oot")) == "mm";
-    if (itemName.empty() || !show) {
+    if (itemName.empty() || !show || !CVarGetInteger(CVAR_REMOTE_ANCHOR("PartnerFeed.Finds"), 1)) {
         return;
     }
     std::string who = "Teammate";

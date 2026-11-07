@@ -47,6 +47,9 @@ struct MMAnchorClient {
     bool isGameComplete = false;
     s16 sceneId = SCENE_MAX; // RAW MM scene (from PLAYER_UPDATE); puppet matches on this
     s32 entrance = 0;
+    // ComboShip: which game the peer was last seen in while loaded (-1 unknown, 0 OOT, 1 MM), for the
+    // game-switch toast. Derived from the client-state sceneNum (MM namespaces it >= 1000).
+    int8_t lastGame = -1;
 
     // Only valid once a PLAYER_UPDATE has arrived (canonical field set; mirrors 2S2H PR #1349).
     uint8_t transformation = 0; // PLAYER_FORM_HUMAN

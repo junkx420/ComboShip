@@ -413,3 +413,21 @@ the teammate's `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS`/`UPDATE_DUNGEON_ITEMS`
 
 Not covered: foreign traps are announced under their raw cross name; the dormant OOT check-tracker
 area totals refresh only once OOT is foreground again.
+
+## Partner feed: game-switch toast + feed toggles (2026-11-07)
+
+**Why:** in split play you lose track of which game your teammate is in, and the feed should be easy to
+silence.
+
+- **Game-switch toast** ("<name> is now in Majora's Mask / Ocarina of Time"), receiver-only, no wire
+  change. A peer's two games share one Anchor clientId and MM namespaces its client-state `sceneNum`
+  (`>= 1000`), so a flip across 1000 between two loaded states is a game switch.
+  - OOT: `Packets/UpdateClientState.cpp` (`HandlePacket_UpdateClientState`, compares against the stored
+    client before overwriting).
+  - MM: `MMAnchor.{h,cpp}`, new `MMAnchorClient::lastGame`, seeded in `HandlePacket_AllClientState`.
+  - Connecting never toasts (ALL_CLIENT_STATE only seeds). Self, other teams and unloaded states are
+    ignored. Only the foreground game toasts; a switch that happened while your current game was dormant
+    is announced late, on that teammate's next state.
+- **Toggles** in the combo Shared > Settings > Network panel (`combo/gui/ComboMenu.cpp`), both default on,
+  local display only: `gRemote.Anchor.PartnerFeed.Finds` (COMBO_PARTNER_FIND toasts) and
+  `gRemote.Anchor.PartnerFeed.GameSwitch`.

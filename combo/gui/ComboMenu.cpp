@@ -94,6 +94,9 @@ constexpr const char* RoomId = "gRemote.Anchor.RoomId";
 constexpr const char* TeamId = "gRemote.Anchor.TeamId";
 constexpr const char* ColorValue = "gRemote.Anchor.Color.Value";
 constexpr const char* ShowOnMinimap = "gRemote.Anchor.ShowOtherPlayersOnMinimap";
+// Live partner feed toggles (read by soh's Anchor and MMAnchor; both default on).
+constexpr const char* PartnerFeedFinds = "gRemote.Anchor.PartnerFeed.Finds";
+constexpr const char* PartnerFeedGameSwitch = "gRemote.Anchor.PartnerFeed.GameSwitch";
 // Room-admin settings: shared store both games read; changes broadcast via SendRoomState.
 constexpr const char* PvpMode = "gRemote.Anchor.RoomSettings.PvpMode";
 constexpr const char* ShowLocationsMode = "gRemote.Anchor.RoomSettings.ShowLocationsMode";
@@ -859,6 +862,25 @@ void DrawNetworkSharedPanel() {
             AnchorSaveCVars();
         }
         ComboRando::ComboMenu_PopCheckbox();
+
+        // Live partner feed: local display preferences only (nothing is sent differently).
+        ImGui::SeparatorText("Partner Feed");
+        bool feedFinds = CVarGetInteger(AnchorCVar::PartnerFeedFinds, 1) != 0;
+        ComboRando::ComboMenu_PushCheckbox(theme);
+        if (ImGui::Checkbox("Show teammate finds", &feedFinds)) {
+            CVarSetInteger(AnchorCVar::PartnerFeedFinds, feedFinds ? 1 : 0);
+            AnchorSaveCVars();
+        }
+        ComboRando::ComboMenu_PopCheckbox();
+        ImGui::TextDisabled("Toast for important items a teammate finds, including in the other game.");
+        bool feedSwitch = CVarGetInteger(AnchorCVar::PartnerFeedGameSwitch, 1) != 0;
+        ComboRando::ComboMenu_PushCheckbox(theme);
+        if (ImGui::Checkbox("Announce game switches", &feedSwitch)) {
+            CVarSetInteger(AnchorCVar::PartnerFeedGameSwitch, feedSwitch ? 1 : 0);
+            AnchorSaveCVars();
+        }
+        ComboRando::ComboMenu_PopCheckbox();
+        ImGui::TextDisabled("Toast when a teammate moves between Ocarina of Time and Majora's Mask.");
     }
 
     // --- Room window: toggle the combo-native floating roster window (only once Anchor is enabled) ---
