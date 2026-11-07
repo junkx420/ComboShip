@@ -412,7 +412,7 @@ static int8_t ClientStateGame(const nlohmann::json& s) {
     if (!s.value("isSaveLoaded", false)) {
         return -1;
     }
-    return s.value("sceneNum", 0) >= MM_ANCHOR_SCENE_NAMESPACE ? 1 : 0;
+    return (int8_t)(s.value("sceneNum", 0) >= MM_ANCHOR_SCENE_NAMESPACE ? 1 : 0);
 }
 
 void MMAnchor::HandlePacket_AllClientState(const nlohmann::json& payload) {

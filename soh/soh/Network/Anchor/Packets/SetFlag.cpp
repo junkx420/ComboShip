@@ -52,12 +52,12 @@ void Anchor_DormantWriteSceneFlag(s16 sceneNum, s16 flagType, s16 flag, bool set
 // Inventory_ReplaceItem minus its Interface_LoadItemIcon1(play, ...) — play is null while dormant, and
 // the C-button icons are reloaded on the next scene load anyway.
 void Anchor_DormantReplaceItem(u16 oldItem, u16 newItem) {
-    for (size_t i = 0; i < ARRAY_COUNT(gSaveContext.inventory.items); i++) {
+    for (s32 i = 0; i < ARRAY_COUNT(gSaveContext.inventory.items); i++) {
         if (gSaveContext.inventory.items[i] == oldItem) {
-            gSaveContext.inventory.items[i] = newItem;
-            for (size_t b = 1; b < ARRAY_COUNT(gSaveContext.equips.buttonItems); b++) {
+            gSaveContext.inventory.items[i] = (u8)newItem;
+            for (s32 b = 1; b < ARRAY_COUNT(gSaveContext.equips.buttonItems); b++) {
                 if (gSaveContext.equips.buttonItems[b] == oldItem) {
-                    gSaveContext.equips.buttonItems[b] = newItem;
+                    gSaveContext.equips.buttonItems[b] = (u8)newItem;
                     break;
                 }
             }
