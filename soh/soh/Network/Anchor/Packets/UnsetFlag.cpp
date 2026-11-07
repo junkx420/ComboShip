@@ -64,12 +64,12 @@ void Anchor::HandlePacket_UnsetFlag(nlohmann::json payload) {
         } else
 #endif
         {
-        auto effect = new GameInteractionEffect::UnsetFlag();
-        effect->parameters[0] = flagType;
-        effect->parameters[1] = flag;
-        effect->Apply();
+            auto effect = new GameInteractionEffect::UnsetFlag();
+            effect->parameters[0] = flagType;
+            effect->parameters[1] = flag;
+            effect->Apply();
 #ifdef COMBO_BUILD
-        delete effect; // ComboShip: Apply() is synchronous and nothing keeps the effect; upstream leaked it per packet.
+            delete effect; // ComboShip: Apply() is synchronous; upstream leaked the effect per packet.
 #endif
         }
 
@@ -113,9 +113,11 @@ void Anchor::HandlePacket_UnsetFlag(nlohmann::json payload) {
                     break;
             }
 #ifdef COMBO_BUILD
+            // ComboShip: no play while dormant, so swap without the HUD icon reload.
             if (isDormantApply) {
-                Anchor_DormantReplaceItem(itemToReplace, Randomizer_GetNextAdultTradeItem()); // no play → no icon reload
-            } else
+                Anchor_DormantReplaceItem(itemToReplace, Randomizer_GetNextAdultTradeItem());
+                return;
+            }
 #endif
             Inventory_ReplaceItem(gPlayState, itemToReplace, Randomizer_GetNextAdultTradeItem());
         }

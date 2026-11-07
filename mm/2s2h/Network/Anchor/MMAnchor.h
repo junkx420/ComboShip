@@ -145,10 +145,10 @@ class MMAnchor {
     void HandlePacket_PlayerUpdate(const nlohmann::json& payload);
     void HandlePacket_DamagePlayer(const nlohmann::json& payload);
     void HandlePacket_GiveItem(const nlohmann::json& payload);
-    void HandlePacket_CrossItem(const nlohmann::json& payload); // issue #3 cross-game delivery
+    void HandlePacket_CrossItem(const nlohmann::json& payload);   // issue #3 cross-game delivery
     void HandlePacket_PartnerFind(const nlohmann::json& payload); // live partner feed (toast only)
-    void ApplyDormantGiveItem(const nlohmann::json& payload);   // A6: dormant-safe co-op item apply
-    void HandlePacket_UpdateTeamState(nlohmann::json& payload); // mutates payload (rando check unpack)
+    void ApplyDormantGiveItem(const nlohmann::json& payload);     // A6: dormant-safe co-op item apply
+    void HandlePacket_UpdateTeamState(nlohmann::json& payload);   // mutates payload (rando check unpack)
     void HandlePacket_RequestTeamState(const nlohmann::json& payload);
     void HandlePacket_RequestTeleport(const nlohmann::json& payload); // answer with our location
     void HandlePacket_TeleportTo(const nlohmann::json& payload);      // warp to peer's location

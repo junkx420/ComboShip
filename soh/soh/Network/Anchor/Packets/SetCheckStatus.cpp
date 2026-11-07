@@ -64,8 +64,8 @@ void Anchor::HandlePacket_SetCheckStatus(nlohmann::json payload) {
     if (!isDormantApply)
 #endif
     {
-    CheckTracker::RecalculateAllAreaTotals();
-    CheckTracker::RecalculateAvailableChecks();
+        CheckTracker::RecalculateAllAreaTotals();
+        CheckTracker::RecalculateAvailableChecks();
     }
     isResultOfHandling = false;
 }
