@@ -153,6 +153,8 @@ class MMAnchor {
     void ApplyDormantGiveItem(const nlohmann::json& payload);     // A6: dormant-safe co-op item apply
     void HandlePacket_UpdateTeamState(nlohmann::json& payload);   // mutates payload (rando check unpack)
     void HandlePacket_RequestTeamState(const nlohmann::json& payload);
+    // Co-op next (2026-11-13): honour the room's "sync items and flags" setting (foreground + dormant).
+    void HandlePacket_UpdateRoomState(const nlohmann::json& payload);
     void HandlePacket_RequestTeleport(const nlohmann::json& payload); // answer with our location
     void HandlePacket_TeleportTo(const nlohmann::json& payload);      // warp to peer's location
 

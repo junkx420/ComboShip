@@ -41,6 +41,9 @@ static const std::string PKT_DAMAGE_PLAYER = "DAMAGE_PLAYER";
 static const std::string PKT_GIVE_ITEM = "GIVE_ITEM";
 static const std::string PKT_UPDATE_TEAM_STATE = "UPDATE_TEAM_STATE";
 static const std::string PKT_REQUEST_TEAM_STATE = "REQUEST_TEAM_STATE";
+// Co-op next (2026-11-13): the room owner's settings. Sent by the server after the handshake and by
+// soh's Anchor when the owner changes them (neither copy carries originGame, so both pass our filter).
+static const std::string PKT_UPDATE_ROOM_STATE = "UPDATE_ROOM_STATE";
 // Issue #3: cross-game item delivery. ComboShip-private packet type (the public server relays unknown
 // types peer-to-peer, so no server change is needed).
 static const std::string PKT_CROSS_ITEM = "COMBO_CROSS_ITEM";
@@ -250,6 +253,8 @@ void MMAnchor::ProcessIncomingPacketQueue() {
                 HandlePacket_UpdateTeamState(payload);
             } else if (type == PKT_REQUEST_TEAM_STATE) {
                 HandlePacket_RequestTeamState(payload);
+            } else if (type == PKT_UPDATE_ROOM_STATE) {
+                HandlePacket_UpdateRoomState(payload);
             } else if (type == PKT_REQUEST_TELEPORT) {
                 HandlePacket_RequestTeleport(payload);
             } else if (type == PKT_TELEPORT_TO) {
@@ -286,7 +291,14 @@ void MMAnchor::PumpDormant() {
         nlohmann::json payload = toProcess.front();
         toProcess.pop();
         try {
-            if (payload.value("type", std::string()) == PKT_GIVE_ITEM && payload.contains("randoCheckId")) {
+            if (payload.value("type", std::string()) == PKT_UPDATE_ROOM_STATE) {
+                // Keep roomState current while dormant: syncItemsAndFlags gates the dormant apply below,
+                // and a client that stays in OOT never handles this packet in MM's foreground.
+                HandlePacket_UpdateRoomState(payload);
+            } else if (payload.value("type", std::string()) == PKT_GIVE_ITEM && payload.contains("randoCheckId")) {
+                if (!roomState.syncItemsAndFlags) {
+                    continue; // the room has item sync off (e.g. the public soh-global room)
+                }
                 SPDLOG_INFO("[MMAnchor] dormant GIVE_ITEM received: {}", payload.dump());
                 ApplyDormantGiveItem(payload);
             } else if (payload.value("type", std::string()) == PKT_REQUEST_TEAM_STATE) {
@@ -677,7 +689,11 @@ void MMAnchor::HandlePacket_GiveItem(const nlohmann::json& payload) {
         return;
     }
     uint32_t clientId = payload.value("clientId", (uint32_t)0);
-    if (clientId == ownClientId) {
+    // Co-op next (2026-11-13): only a NONZERO match is our own echo, like the dormant path
+    // (ApplyDormantGiveItem). A sender that has no id yet stamps 0, and so do we until the roster
+    // arrives; 0 == 0 used to drop a teammate's item here. An echo of our own find that slips through
+    // with id 0 is still harmless: its check is already obtained (next test).
+    if (clientId != 0 && clientId == ownClientId) {
         return; // never re-apply our own broadcast
     }
     // Shared progression is per-team; ignore items for other teams.
@@ -687,6 +703,13 @@ void MMAnchor::HandlePacket_GiveItem(const nlohmann::json& payload) {
 
     int32_t checkId = payload.value("randoCheckId", -1);
     RandoCheckId rc = (checkId >= 0 && checkId < RC_MAX) ? (RandoCheckId)checkId : RC_UNKNOWN;
+    // Co-op next (2026-11-13): no usable check id means nothing to mark obtained, so a replay (server
+    // queue, the launcher's outbox) would grant the item again each time. The dormant path already
+    // refused these; a real sender always has a check (see MMAnchor_BroadcastCheckItem).
+    if (rc == RC_UNKNOWN) {
+        SPDLOG_INFO("[MMAnchor] GIVE_ITEM dropped: bad check id {}", checkId);
+        return;
+    }
     // Idempotent per check: if we already collected this check locally (both players reached it, or a
     // duplicate/late broadcast), don't grant its item again.
     if (rc != RC_UNKNOWN && RANDO_SAVE_CHECKS[rc].obtained) {
@@ -709,6 +732,23 @@ void MMAnchor::HandlePacket_GiveItem(const nlohmann::json& payload) {
         RANDO_SAVE_CHECKS[rc].cycleObtained = true;
         RANDO_SAVE_CHECKS[rc].eligible = false;
     }
+}
+
+// Co-op next (2026-11-13): MM never read the room settings, so `syncItemsAndFlags` stayed at its
+// default (on) whatever the owner chose — including the public soh-global room, which hardcodes item
+// sync OFF. Only that one field is taken: pvpMode stays at its default on purpose, because the PvP
+// receive side (HandlePacket_DamagePlayer) is still a stub and the puppet would start reporting hits.
+// A field of the wrong type throws; both callers catch and keep the previous value.
+void MMAnchor::HandlePacket_UpdateRoomState(const nlohmann::json& payload) {
+    auto state = payload.find("state");
+    if (state == payload.end() || !state->is_object()) {
+        return;
+    }
+    const int sync = state->value("syncItemsAndFlags", (int)roomState.syncItemsAndFlags);
+    if ((sync != 0) != (roomState.syncItemsAndFlags != 0)) {
+        SPDLOG_INFO("[MMAnchor] room item/flag sync is now {}", sync != 0 ? "on" : "off");
+    }
+    roomState.syncItemsAndFlags = static_cast<uint8_t>(sync != 0 ? 1 : 0); // explicit: MSVC C4244 under /WX
 }
 
 // Called from the rando check-obtain seam (CheckQueue.cpp) under COMBO_BUILD when the LOCAL player
