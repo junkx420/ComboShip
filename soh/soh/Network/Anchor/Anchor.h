@@ -163,6 +163,9 @@ class Anchor : public Network {
 #endif
     void SendJsonToRemote(nlohmann::json packet);
     bool IsSaveLoaded();
+    // ComboShip (2026-11-13): condition for the save-progress hooks (items, flags, checks, entrances).
+    // Combo: also while enabled-but-reconnecting, so the launcher can hold the packets (see Anchor.cpp).
+    bool ProgressHooksActive();
     bool CanTeleportTo(uint32_t clientId);
     uint32_t GetDummyPlayerClientId(const Actor* actor);
 

@@ -31,7 +31,9 @@ extern "C" void (*gComboMarkForeignObtained)(int srcGame, const char* checkName)
 // Broadcast a locally-collected foreign item to teammates (called from hook_handlers.cpp). No-op
 // when Anchor is disconnected or item sync is off.
 extern "C" void Anchor_BroadcastCrossItem(int targetGame, const char* itemName, const char* srcCheckName) {
-    if (!Anchor::Instance || !Anchor::Instance->isConnected || !itemName || !srcCheckName) {
+    // Co-op hardening (2026-11-13): ProgressHooksActive, not isConnected — a cross item found while the
+    // launcher is reconnecting is held in its outbox instead of being lost (see SendJsonToRemote).
+    if (!Anchor::Instance || !Anchor::Instance->ProgressHooksActive() || !itemName || !srcCheckName) {
         return;
     }
     if (!Anchor::Instance->roomState.syncItemsAndFlags) {
@@ -44,6 +46,9 @@ extern "C" void Anchor_BroadcastCrossItem(int targetGame, const char* itemName, 
     payload["srcGame"] = 0;             // collected in OOT
     payload["itemName"] = itemName;     // neutral CrossForeign name, in the target game's namespace
     payload["srcCheckName"] = srcCheckName;
+    // Co-op hardening (2026-11-13): server-queue it for a teammate who is offline right now, like GIVE_ITEM.
+    // Safe to replay: receivers dedup on srcCheckName and mark the source check obtained.
+    payload["addToQueue"] = true;
     Anchor::Instance->SendJsonToRemote(payload);
     // Live partner feed: a teammate currently in OOT gets this item silently into their dormant MM.
     // (Declared in Anchor.h.)
@@ -192,10 +197,29 @@ void Anchor::ProcessOutgoingPackets() {
     }
 }
 
+bool Anchor::ProgressHooksActive() {
+#ifdef COMBO_BUILD
+    // Co-op hardening (2026-11-13): while Anchor is enabled but the launcher is reconnecting, keep the
+    // save-progress hooks live so their packets reach the launcher, which holds the save-affecting ones in
+    // its outbox and sends them after the next handshake (combo/ComboShip.cpp, ComboAnchor).
+    return isConnected || isEnabled;
+#else
+    return isConnected;
+#endif
+}
+
 void Anchor::SendJsonToRemote(nlohmann::json payload) {
+#ifdef COMBO_BUILD
+    // Co-op hardening (2026-11-13): hand packets to the launcher while it is reconnecting too; it keeps
+    // only the save-affecting ones (outbox) and drops live-only ones. Nothing goes out once disabled.
+    if (!isConnected && !isEnabled) {
+        return;
+    }
+#else
     if (!isConnected) {
         return;
     }
+#endif
 
     payload["clientId"] = ownClientId;
     if (!payload.contains("quiet")) {

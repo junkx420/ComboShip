@@ -76,11 +76,16 @@ target_include_directories(comboui PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../soh/soh/Extractor
 )
 target_link_libraries(comboui PRIVATE libultraship)
+# ComboMenu.cpp opens the co-op diagnostics folder via ShellExecuteW.
+if(WIN32)
+    target_link_libraries(comboui PRIVATE shell32)
+endif()
 add_dependencies(comboui libultraship)
 
 # Source files
 set(COMBO_SOURCES
     ComboShip.cpp
+    ComboNetKeepAlive.cpp # co-op hardening: TCP keepalive on the Anchor socket
 )
 
 # Create executable
@@ -109,6 +114,10 @@ if(TARGET SDL2_net::SDL2_net-static)
     target_link_libraries(ComboShip PRIVATE SDL2_net::SDL2_net-static SDL2::SDL2)
 else()
     target_link_libraries(ComboShip PRIVATE SDL2_net::SDL2_net SDL2::SDL2)
+endif()
+# ComboNetKeepAlive.cpp calls setsockopt/WSAIoctl directly (SDL2_net only links Winsock privately).
+if(WIN32)
+    target_link_libraries(ComboShip PRIVATE ws2_32)
 endif()
 
 # Add dependencies to ensure games are built first

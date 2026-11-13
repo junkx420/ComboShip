@@ -66,6 +66,11 @@ void PollSnapshot() {
 std::shared_ptr<ComboAnchorRoomWindow> sWindow;
 } // namespace
 
+std::string AnchorRosterJson() {
+    const char* raw = sRosterProvider ? sRosterProvider() : nullptr;
+    return raw ? std::string(raw) : std::string("{}");
+}
+
 void ComboAnchorRoomWindow::Draw() {
     if (!IsVisible()) {
         return;

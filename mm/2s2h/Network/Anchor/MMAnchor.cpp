@@ -613,6 +613,9 @@ void MMAnchor::SendPacket_GiveItem(int16_t randoItemId, int32_t randoCheckId) {
     payload["targetTeamId"] = CVarGetString(kCvarTeamId, "default");
     payload["getItemId"] = randoItemId;     // RAW rando item id; receiver ConvertItems for its own state
     payload["randoCheckId"] = randoCheckId; // so receivers can mark the check obtained (no double-collect)
+    // Co-op hardening (2026-11-13): server-queue it for a teammate who is offline right now, like soh's
+    // GIVE_ITEM. Safe to replay: the receiver skips a check it already has marked obtained.
+    payload["addToQueue"] = true;
     SendJson(payload);
     SPDLOG_INFO("[MMAnchor] GIVE_ITEM sent: check={} item={}", randoCheckId, randoItemId);
 
@@ -730,6 +733,8 @@ void MMAnchor::SendPacket_CrossItem(int targetGame, const char* itemName, const 
     payload["srcGame"] = 1;             // collected in MM
     payload["itemName"] = itemName;     // neutral CrossForeign name, in the target game's namespace
     payload["srcCheckName"] = srcCheckName;
+    // Co-op hardening (2026-11-13): server-queue for an offline teammate (receivers dedup on srcCheckName).
+    payload["addToQueue"] = true;
     SendJson(payload);
 }
 
@@ -1279,6 +1284,19 @@ extern "C" COMBO_EXPORT void MM_Anchor_RequestResync(void) {
     } catch (const std::exception& e) { SPDLOG_ERROR("[MM_Anchor_RequestResync] {}", e.what()); } catch (...) {
         SPDLOG_ERROR("[MM_Anchor_RequestResync] unknown exception");
     }
+}
+
+// Co-op hardening (2026-11-13): launcher link/presence toasts. Callable from the launcher's Anchor
+// thread (EmitThreadSafe queues it for the UI frame). gateCvar: a default-on display toggle, or null.
+extern "C" COMBO_EXPORT void MM_ComboToast(const char* prefix, const char* message, const char* suffix,
+                                           const char* gateCvar) {
+    try {
+        if (gateCvar && gateCvar[0] != '\0' && !CVarGetInteger(gateCvar, 1)) {
+            return;
+        }
+        Notification::EmitThreadSafe(
+            { .prefix = prefix ? prefix : "", .message = message ? message : "", .suffix = suffix ? suffix : "" });
+    } catch (...) {} // never unwind into the launcher
 }
 
 extern "C" COMBO_EXPORT void MM_Anchor_RecvJson(const char* json) {
