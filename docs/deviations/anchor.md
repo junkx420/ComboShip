@@ -520,3 +520,96 @@ closed.
 Not covered: finds made before the first successful connection of a session; MM flag sync (Phase 2c,
 unchanged); per-packet delivery acknowledgement (a packet the OS accepted just before a link died is
 still lost, as before; the next save's `UPDATE_TEAM_STATE` covers it).
+
+## Co-op next, block 1: game-thread link handling, outbox scoping, MM room state (2026-11-13)
+
+**Why:** a read-through of the hardening above, plus the relay server's source
+(`garrettjoecox/anchor`: `server.go`, `client.go`, `room.go`, `team.go`), found five defects.
+
+1. The launcher's receive thread called `SOH_Anchor_OnConnected` / `OnDisconnected` /
+   `MM_Anchor_Activate`. `Anchor::RegisterHooks` re-registers ~45 GameInteractor hooks (plain
+   `unordered_map`s, no lock), `SendPacket_Handshake` reads `gPlayState`, and MM's `Activate` does both —
+   all next to a running game frame, on every (re)connect. Upstream has the same pattern but no
+   auto-reconnect.
+2. `Anchor::OnIncomingJson` ran its client-version filter on that thread too, reading `clients` and even
+   inserting into it (`clients[clientId]`).
+3. The server drops every packet that arrives before the `HANDSHAKE` ("Client must handshake first").
+   `sConnected` was set before the handshake was queued, so a find made in that window was sent first and
+   silently lost.
+4. The outbox deleted held packets of a *different* loaded seed, on disk too: with two co-op playthroughs
+   in two slots, loading slot B threw away slot A's undelivered finds. It also had no room scope, so held
+   packets went to whatever room was joined next.
+5. The server tells sender from receivers by the packet's own `clientId` field (`broadcastPacket` skips
+   the client with that id). A held packet keeps the id it was made with; with a stale or zero id (first
+   session ever, or a new id after reconnecting from another room) it is echoed back to its sender — and
+   OOT's `GIVE_ITEM` receive has no self check, so the item is granted twice.
+
+**Launcher (`combo/ComboShip.cpp`, `ComboAnchor`; combo-owned):**
+- **Link epoch.** The receive thread only calls `SetLinkLocked`, which bumps `sLinkEpoch` (odd = socket
+  up). `SyncLinkOnGameThread`, first thing in the per-frame `PumpDormant`, replays the change on the game
+  thread: `SOH_Anchor_OnDisconnected` for the old state, then `SOH_Anchor_OnConnected`,
+  `MM_Anchor_Activate` when MM is foreground, and both resync requests. A counter, not a flag, so a drop
+  + reconnect between two frames still triggers a new handshake. `sResyncPending` is gone. The only game
+  entry points left on the receive thread are the two `*_RecvJson` exports (enqueue under the game's own
+  mutex) and the thread-safe toast.
+- **Handshake first.** `Send()` queues nothing until this connection's `HANDSHAKE` is queued
+  (`sHandshakeQueued`): save-affecting packets go to the outbox, live-only ones are dropped. A second
+  `HANDSHAKE` on the same socket is refused (the server would disconnect "the other session with this
+  client id", i.e. us). The pre-check for the handshake is a `strstr`, so per-frame pose packets still
+  cost no JSON parse.
+- **Outbox rules moved to `combo/net/ComboAnchorOutbox.h`** (new, header-only, no globals/locks/IO):
+  durable packet types, flush selection, disk format, expiry, client-id restamp.
+  - An entry is sent when its room scope matches (or it has none) **and** its seed matches the loaded
+    slot (or it has none). Everything else *stays* until it expires (48 h, now also checked on flush).
+  - **Room scope** = `host:port/roomId`, taken from our own `HANDSHAKE` as it passes through `Send()`.
+    Entries held before the first handshake of a session carry no scope and are adopted by that room.
+    `coop-outbox.json` gains an optional `scope` field; files from the first outbox build still load,
+    and that build ignores the field.
+  - **Restamp.** Flush waits for the server to confirm our client id on this connection (self entry of
+    `ALL_CLIENT_STATE`, at most 10 s) and rewrites `clientId` in every packet it sends.
+- **Disk IO off the game thread's lock.** `PersistOutboxIfDirty` builds the JSON text under `sOutMutex`
+  and writes the file after releasing it, so `Send()` never waits for the disk. The flush/persist check
+  runs every 250 ms instead of on every 5 ms loop spin.
+
+**soh (`COMBO_BUILD`-guarded, original lines kept under `#else` / `#ifndef`):**
+- `HookHandlers.cpp`: the `OnGameFrameUpdate` hook is registered once and never re-registered (was
+  `COND_HOOK(..., isConnected, ...)`). It has to run while enabled-but-connecting, because that is where
+  the game thread learns about the link, and it must not be re-registered from inside itself:
+  `OnConnected -> RegisterHooks` is now reached from this hook, and registering the same hook type there
+  would insert into the map GameInteractor is iterating. It does nothing while Anchor is disabled.
+- `Anchor.cpp`: `Enable()` and `Disable()` call `RegisterHooks()`. `Enable` installs the frame hook and
+  the save-progress hooks (`ProgressHooksActive`) immediately, which closes the gap noted above: finds
+  before the *first* connection of a session are now held too. `Disable` drops the hooks itself, since the
+  receive thread no longer calls `OnDisconnected` (unregistering is deferred by GameInteractor, so this is
+  safe from inside a hook, e.g. `DISABLE_ANCHOR`).
+- `Anchor.cpp` / `Anchor.h`: the version filter is `ComboDropForVersionMismatch`, called when a queue is
+  drained (`ProcessIncomingPacketQueue`, `PumpDormant`). Same rule as upstream's block in
+  `OnIncomingJson`, which is now `#ifndef COMBO_BUILD`.
+
+**MM (`mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}`, combo-owned):**
+- `UPDATE_ROOM_STATE` is handled, foreground and dormant (`HandlePacket_UpdateRoomState`). MM never read
+  the room settings, so `syncItemsAndFlags` stayed on whatever the owner chose — including the public
+  `soh-global` room, which hardcodes item sync off. Only that field is taken; `pvpMode` keeps its default
+  because MM's PvP receive side is still a stub. The dormant `GIVE_ITEM` apply now respects the flag too.
+- Foreground `GIVE_ITEM`: a packet without a usable check id is refused (the dormant path already did);
+  it has nothing to mark obtained, so every replay would grant again. The self-echo test only matches a
+  nonzero client id, like the dormant path (0 == 0 used to drop a teammate's item).
+
+**Tests / CI:**
+- `combo/tests/ComboAnchorOutboxTest.cpp` + target `combo_anchor_tests` (`EXCLUDE_FROM_ALL`, needs only
+  nlohmann_json): packet classification, cap, seed and room scoping, scope adoption, expiry, restamp,
+  disk round trip, defensive load. `build-linux.yml` builds and runs it before the game targets.
+- `build-macos.yml`: `macos-14` -> `macos-15` (the old label failed at provisioning, before any step).
+
+**Limits / not covered:**
+- A held entry without a scope that was written to disk and never reached a room in that session is
+  adopted by the first room of the next run.
+- The team id is not part of the scope: a held packet keeps the `targetTeamId` it was made with.
+- OOT `GIVE_ITEM` is still not idempotent on the receive side; the restamp only removes the self-echo
+  case. Per-packet ids with receive-side dedup are block 2.
+- The server keeps rooms in memory only and deletes them after 5 minutes without activity, with their
+  `addToQueue` queue and stored team state; it has one state slot per team (OOT and MM overwrite each
+  other) and clears the queue on any `UPDATE_TEAM_STATE`. So the server queue only bridges short
+  absences, and the `addToQueue` notes above overstate it; the real safety net is the union resync when
+  both players are online. Splitting the team state per game is block 2.
+- MM flag sync is unchanged (block 3).
