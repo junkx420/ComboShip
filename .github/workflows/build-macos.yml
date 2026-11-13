@@ -19,8 +19,9 @@ env:
 
 jobs:
   build:
-    # arm64, matching upstream Shipwright's macOS runner.
-    runs-on: macos-14
+    # arm64. macos-14 is no longer provisioned ("The configuration 'macos-14-arm64-us-default' is not
+    # supported", job dies in 1 s before any step), so use the next arm64 image.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
