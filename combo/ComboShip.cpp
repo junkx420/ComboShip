@@ -29,6 +29,8 @@
 #include <queue>
 #include <deque>
 #include <ctime>
+#include <cstdio>
+#include <random>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 
@@ -41,7 +43,8 @@
 #include "rando/CrossWorldRando.h"
 #include "rando/ComboPlaythrough.h"
 #include "rando/CrossHints.h"
-#include "net/ComboAnchorOutbox.h" // co-op outbox rules (pure logic, unit-tested in combo/tests)
+#include "net/ComboAnchorOutbox.h"   // co-op outbox rules (pure logic, unit-tested in combo/tests)
+#include "net/ComboAnchorDelivery.h" // packet ids + dedup, ack markers, team-state request gate (ditto)
 #include "gui/ComboGenProgress.h"
 #include "ComboExtract.h"
 #include "ComboSettingsImport.h"
@@ -1010,6 +1013,47 @@ static std::atomic<uint32_t> sOwnIdThisConn{ 0 };
 // long (unstamped) rather than holding progress back for the whole connection.
 constexpr int kFlushOwnIdWaitSeconds = 10;
 
+// ---- Co-op next block 2 (2026-11-14): delivery. Rules in combo/net/ComboAnchorDelivery.h. ----
+// Ids of save-affecting packets this client has already handed to its games (live, or inside a
+// team-state queue). A second copy is dropped. Own mutex: the receive thread inserts, the game thread
+// clears it when a save slot is (re)loaded — from then on the games' state is the file's again, so
+// "already applied" no longer holds and a replay must be let through.
+static std::mutex sSeenMutex;
+static Core::SeenIds sSeenIds;
+// Receive thread only. Save-affecting packets written to the socket and not yet confirmed by an
+// echoed marker; re-held when the connection dies (see ReceiveLoop).
+static Core::InFlight sInFlight;
+// True once a marker has come back from this server (since Connect()). Until then nothing is re-held:
+// a relay that does not loop markers back would make every drop re-send the last 512 packets.
+static std::atomic<bool> sMarkerProven{ false };
+// Guarded by sOutMutex. Lets one REQUEST_TEAM_STATE out at a time (see the header for why).
+static Core::TeamStateRequestGate sTeamReqGate;
+
+static int64_t SteadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Unique per packet across processes and machines: a random per-process prefix plus a counter. Stamped
+// once in Send(); a held packet keeps its id through the outbox, the disk and every re-send.
+static std::string NextPacketId() {
+    static const std::string sPrefix = [] {
+        std::random_device rd;
+        const uint64_t v = ((uint64_t)rd() << 32) ^ (uint64_t)rd() ^ ((uint64_t)std::time(nullptr) << 20);
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)v);
+        return std::string(buf);
+    }();
+    static std::atomic<uint64_t> sCounter{ 0 };
+    return sPrefix + "-" + std::to_string(sCounter.fetch_add(1) + 1);
+}
+
+// Game thread: a save slot was (re)loaded.
+static void ResetSeenPacketIds() {
+    std::lock_guard<std::mutex> lk(sSeenMutex);
+    sSeenIds.Clear();
+}
+
 static void Toast(const char* prefix, const char* message, const char* suffix, const char* gateCvar) {
     FnComboToast fn = sActiveGame.load() == 1 ? MM_ComboToast : SOH_ComboToast;
     if (fn)
@@ -1093,6 +1137,26 @@ static void OutboxPushLocked(const std::string& packet) {
         std::cerr << "[ComboShip][Anchor] co-op outbox full, dropped the oldest held packet\n";
     sOutboxCount.store((int)sOutbox.size());
     sOutboxDirty = true;
+}
+
+// Hold sOutMutex. Packets that were written to a socket but never confirmed: they are older than
+// anything held since, so they go to the FRONT, in their original order.
+static void OutboxPushFrontLocked(std::vector<std::string>& packets) {
+    const uint32_t seed = g_loadedMasterSeed.load();
+    const int64_t now = (int64_t)std::time(nullptr);
+    for (auto it = packets.rbegin(); it != packets.rend(); ++it) {
+        OutboxEntry entry;
+        entry.seed = seed;
+        entry.heldAt = now;
+        entry.scope = sScope;
+        entry.packet = std::move(*it);
+        sOutbox.push_front(std::move(entry));
+    }
+    while (sOutbox.size() > Core::kOutboxMaxEntries)
+        sOutbox.pop_back(); // keep the oldest: the newest are the most likely to be covered by a resync
+    sOutboxCount.store((int)sOutbox.size());
+    if (!packets.empty())
+        sOutboxDirty = true;
 }
 
 // Network thread, while connected: move the held packets that belong to this room and to the loaded
@@ -1357,6 +1421,53 @@ static void HoldUnsentLocked(std::queue<std::string>& unsent) {
     }
 }
 
+// Receive thread, for every inbound packet before it is handed to the games. False = consumed here.
+//  - our own ack marker coming back: confirms what was written before it;
+//  - UPDATE_TEAM_STATE: lets the next parked team-state request out, and loses the queue entries this
+//    client already has (same reply twice, or packets that also arrived live);
+//  - a save-affecting packet whose id was already passed on: dropped.
+// Packets without an id (older fork builds, plain SoH Anchor) pass untouched.
+static bool AcceptInbound(std::string& packet) {
+    const char* text = packet.c_str();
+    if (std::strstr(text, Core::kAckMarkType) != nullptr) {
+        if (const uint32_t number = Core::AckMarkNumber(packet); number != 0) {
+            sInFlight.OnMarkerEchoed(number);
+            sMarkerProven = true;
+            return false;
+        }
+    }
+    if (Core::LooksLikeTeamState(text)) {
+        {
+            std::lock_guard<std::mutex> lk(sOutMutex);
+            std::string next = sTeamReqGate.OnReply(SteadyNowMs());
+            if (!next.empty() && sConnected && sHandshakeQueued)
+                sOutQueue.push(std::move(next));
+        }
+        if (std::strstr(text, Core::kPacketIdField) != nullptr) {
+            size_t removed = 0;
+            {
+                std::lock_guard<std::mutex> lk(sSeenMutex);
+                removed = Core::FilterTeamStateQueue(packet, sSeenIds);
+            }
+            if (removed != 0)
+                std::cout << "[ComboShip][Anchor] team-state queue: skipped " << removed
+                          << " packet(s) this client already has" << std::endl;
+        }
+        return true;
+    }
+    if (Core::HasTopLevelPacketId(text)) {
+        const std::string id = Core::PacketId(packet);
+        if (!id.empty()) {
+            std::lock_guard<std::mutex> lk(sSeenMutex);
+            if (!sSeenIds.Insert(id)) {
+                std::cout << "[ComboShip][Anchor] dropped a duplicate packet (" << id << ")" << std::endl;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static void ReceiveLoop() {
     IPaddress address;
     while (sEnabled && SDLNet_ResolveHost(&address, sHost.c_str(), sPort) == -1) {
@@ -1407,8 +1518,10 @@ static void ReceiveLoop() {
             // (SyncLinkOnGameThread); until that is queued, Send() holds or drops everything else.
             std::lock_guard<std::mutex> lk(sOutMutex);
             sHandshakeQueued = false;
+            sTeamReqGate.Reset(); // nothing is on the wire of this connection yet
             SetLinkLocked(true);
         }
+        uint32_t markerNumber = 0; // ack markers are numbered per connection
         Toast("Co-op", reconnect ? "reconnected" : "connected", "", "gRemote.Anchor.PartnerFeed.Connection");
         lostToastShown = false;
 
@@ -1428,6 +1541,11 @@ static void ReceiveLoop() {
                     Toast("Co-op", "sent", n.c_str(), "gRemote.Anchor.PartnerFeed.Connection");
                 }
                 PersistOutboxIfDirty(); // also covers packets Send() held while waiting for the handshake
+                // A team-state request that got no answer must not block the other game's forever.
+                std::lock_guard<std::mutex> lk(sOutMutex);
+                std::string next = sTeamReqGate.OnTick(SteadyNowMs());
+                if (!next.empty() && sHandshakeQueued)
+                    sOutQueue.push(std::move(next));
             }
 
             // Drain outbound queue (packets handed to us by the game via Send()).
@@ -1446,7 +1564,23 @@ static void ReceiveLoop() {
                     sendFailed = true;
                     break;
                 }
+                if (Core::HasTopLevelPacketId(p.c_str()))
+                    sInFlight.OnSent(p); // save-affecting: wait for the server to confirm it
                 toSend.pop();
+            }
+            // Ask the server to confirm what was just written: a marker addressed to ourselves. It can
+            // only be written once the server has told us our client id on this connection.
+            if (!sendFailed && sInFlight.HasUnmarked()) {
+                if (const uint32_t ownId = sOwnIdThisConn.load(); ownId != 0) {
+                    const std::string mark = Core::MakeAckMark(ownId, markerNumber + 1);
+                    const int want = (int)mark.size() + 1;
+                    if (SDLNet_TCP_Send(socket, mark.c_str(), want) < want) {
+                        std::cerr << "[ComboShip][Anchor] send failed: " << SDLNet_GetError() << std::endl;
+                        sendFailed = true;
+                    } else {
+                        sInFlight.OnMarkerSent(++markerNumber);
+                    }
+                }
             }
             if (sendFailed) {
                 // The failed packet is still at toSend's front: it was never framed completely, so the
@@ -1475,6 +1609,9 @@ static void ReceiveLoop() {
             while (pos != std::string::npos) {
                 std::string packet = received.substr(0, pos);
                 received.erase(0, pos + 1);
+                pos = received.find('\0');
+                if (!AcceptInbound(packet))
+                    continue; // our own ack marker, or a save-affecting packet we already passed on
                 // Keep the always-live combo roster in sync before forwarding (fixes dormant staleness).
                 UpdateRosterFromPacket(packet);
                 // A6: feed every packet to BOTH games. Each RecvJson only enqueues (thread-safe). The
@@ -1485,7 +1622,6 @@ static void ReceiveLoop() {
                     SOH_Anchor_RecvJson(packet.c_str());
                 if (MM_Anchor_RecvJson)
                     MM_Anchor_RecvJson(packet.c_str());
-                pos = received.find('\0');
             }
         }
 
@@ -1498,6 +1634,15 @@ static void ReceiveLoop() {
             SetLinkLocked(false); // the game thread tells soh's Anchor (SyncLinkOnGameThread)
             sHandshakeQueued = false;
             HoldUnsentLocked(sOutQueue);
+            // Written to the socket but never confirmed by a marker: the server may or may not have them.
+            // Send them again on the next connection; receivers drop the copy they already have (packet
+            // id). Only once this server has proven that it echoes markers at all.
+            std::vector<std::string> unconfirmed = sInFlight.TakeUnconfirmed();
+            if (sMarkerProven && !unconfirmed.empty()) {
+                std::cout << "[ComboShip][Anchor] " << unconfirmed.size()
+                          << " sent packet(s) were not confirmed by the server, holding them again" << std::endl;
+                OutboxPushFrontLocked(unconfirmed);
+            }
         }
         PersistOutboxIfDirty();
         if (sEnabled && !lostToastShown) {
@@ -1526,6 +1671,7 @@ static void Connect(const char* host, uint16_t port) {
         std::lock_guard<std::mutex> lk(sOutMutex);
         sScope.clear();
     }
+    sMarkerProven = false; // possibly another server: it has to echo a marker first
     sEverConnected = false;
     sEnabled = true;
     if (sThread.joinable())
@@ -1564,18 +1710,29 @@ static void Send(const char* json) {
     // Our own scene/room-state is broadcast OUTBOUND (never echoed inbound), so parse it here too or the
     // self roster row would freeze at its join value.
     UpdateRosterFromPacket(json);
-    // Cheap pre-check so the per-frame pose packets never pay for a JSON parse: nlohmann dumps without
-    // whitespace, and a quote inside a string value is escaped, so this text can only be the type key.
-    const bool maybeHandshake = std::strstr(json, "\"type\":\"HANDSHAKE\"") != nullptr;
-    std::lock_guard<std::mutex> lk(sOutMutex);
-    if (sConnected && sHandshakeQueued && !maybeHandshake) {
-        sOutQueue.push(json);
+    // Cheap pre-checks so the per-frame pose packets never pay for a JSON parse (see the header).
+    const bool special = std::strstr(json, "\"type\":\"HANDSHAKE\"") != nullptr || Core::MightBeDurable(json) ||
+                         Core::LooksLikeTeamStateRequest(json);
+    if (!special) {
+        // Live-only traffic: goes out if the connection is usable, is dropped otherwise (MM keeps
+        // sending poses while offline, which used to pile up unbounded here).
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        if (sConnected && sHandshakeQueued)
+            sOutQueue.push(json);
         return;
     }
-    if (!sEnabled)
-        return;
+
     std::string packet(json);
     const std::string type = Core::PacketType(packet);
+    const bool durable = Core::IsDurablePacketType(type);
+    // Co-op next block 2: every save-affecting packet gets its id here, once, before it is queued or
+    // held. Receivers drop a second copy, which is what makes re-sending after a drop safe.
+    if (durable)
+        packet = Core::StampPacketId(packet, NextPacketId());
+
+    std::lock_guard<std::mutex> lk(sOutMutex);
+    if (!sEnabled)
+        return;
     if (type == "HANDSHAKE") {
         // Exactly one per connection: without a socket there is nobody to greet, and a second one on
         // the same socket makes the server disconnect "the other session with this client id" — us.
@@ -1592,13 +1749,18 @@ static void Send(const char* json) {
         return;
     }
     if (sConnected && sHandshakeQueued) {
+        // One team-state request on the wire at a time; the others wait for its answer (AcceptInbound)
+        // or a timeout (ReceiveLoop).
+        if (type == "REQUEST_TEAM_STATE" &&
+            !sTeamReqGate.OnRequest(Core::PacketStringField(packet, "originGame"), packet, SteadyNowMs()))
+            return;
         sOutQueue.push(std::move(packet));
         return;
     }
     // Co-op hardening (2026-11-13): no usable connection (down, or up but not introduced yet — the
     // server drops everything before the HANDSHAKE). Hold save-affecting packets for the next flush;
-    // drop live-only ones (MM keeps sending poses while offline, which used to pile up unbounded here).
-    if (Core::IsDurablePacketType(type))
+    // drop the rest.
+    if (durable)
         OutboxPushLocked(packet); // written to disk by the network thread (PersistOutboxIfDirty), not here
 }
 
@@ -1759,6 +1921,8 @@ static void LoadComboCompletion(int slot) {
         // Shared Items: absent key = mask 0 = feature off (old seeds unaffected).
         g_sharedMask = ComboRando::SharedMaskFromKeys(rando.value("sharedItems", nlohmann::json::array()));
         g_loadedMasterSeed.store(rando.value("masterSeed", 0u)); // co-op outbox scope
+        // The games' state is the file's again: what was "already applied" may not be any more.
+        ComboAnchor::ResetSeenPacketIds();
     }
     // Push outside the container lock — the DLL setters must never re-enter the sidecar.
     if (SOH_SetComboGoal)

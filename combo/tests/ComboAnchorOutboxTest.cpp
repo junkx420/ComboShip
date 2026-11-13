@@ -1,28 +1,15 @@
 // combo/tests/ComboAnchorOutboxTest.cpp — unit tests for the co-op outbox rules
-// (combo/net/ComboAnchorOutbox.h). No game, no socket, no ROM: builds as the `combo_anchor_tests`
-// target and runs in CI. Deliberately framework-free (one CHECK macro) so it adds no dependency.
-// Exit code 0 = all checks passed.
+// (combo/net/ComboAnchorOutbox.h). Part of the `combo_anchor_tests` target (see ComboAnchorTestsMain.cpp).
 
 #include "net/ComboAnchorOutbox.h"
 
 #include <cstdint>
 #include <deque>
-#include <iostream>
 #include <string>
 
+#include "ComboTestCheck.h"
+
 using namespace ComboAnchorCore;
-
-static int sFailures = 0;
-static int sChecks = 0;
-
-#define CHECK(cond)                                                                         \
-    do {                                                                                    \
-        sChecks++;                                                                          \
-        if (!(cond)) {                                                                      \
-            sFailures++;                                                                    \
-            std::cerr << "FAILED " << __FILE__ << ":" << __LINE__ << "  " << #cond << "\n"; \
-        }                                                                                   \
-    } while (0)
 
 static const int64_t kNow = 1800000000; // any fixed "now" (unix seconds)
 static const std::string kRoomA = MakeScope("anchor.hm64.org", 43383, "roomA");
@@ -234,7 +221,7 @@ static void TestLoadIsDefensive() {
     CHECK(outbox.empty());
 }
 
-int main() {
+void RunOutboxTests() {
     TestPacketClassification();
     TestPushCapDropsOldest();
     TestFlushSeedScoping();
@@ -244,11 +231,4 @@ int main() {
     TestRestampClientId();
     TestPersistenceRoundTrip();
     TestLoadIsDefensive();
-
-    if (sFailures != 0) {
-        std::cerr << sFailures << " of " << sChecks << " checks FAILED\n";
-        return 1;
-    }
-    std::cout << "combo_anchor_tests: all " << sChecks << " checks passed\n";
-    return 0;
 }
