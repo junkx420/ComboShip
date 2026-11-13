@@ -112,10 +112,32 @@ void Anchor::RegisterHooks() {
         SendPacket_PlayerUpdate();
     });
 
+#ifdef COMBO_BUILD
+    // Co-op next (2026-11-13): registered ONCE and never re-registered. The launcher's receive thread
+    // no longer calls OnConnected/OnDisconnected; the pump below is where this (game) thread learns
+    // about a new or lost connection (ComboAnchor::SyncLinkOnGameThread), so it has to run while Anchor
+    // is enabled but not connected yet. It also must not be a COND_HOOK: OnConnected -> RegisterHooks
+    // is now reached from inside this very hook, and re-registering OnGameFrameUpdate there would
+    // insert into the unordered_map GameInteractor is iterating. The other hook types are fine.
+    static bool sComboFrameHookRegistered = false;
+    if (!sComboFrameHookRegistered) {
+        sComboFrameHookRegistered = true;
+        GameInteractor::Instance->RegisterGameHook<GameInteractor::OnGameFrameUpdate>([this]() {
+            if (!isEnabled && !isConnected) {
+                return;
+            }
+            if (isConnected) {
+                ProcessIncomingPacketQueue();
+            }
+            ComboPumpDormantTick(); // link sync + A6: drive dormant sibling's apply while OOT is foreground
+        });
+    }
+#else
     COND_HOOK(OnGameFrameUpdate, isConnected, [&]() {
         ProcessIncomingPacketQueue();
         ComboPumpDormantTick(); // A6: drive dormant sibling's apply while OOT is foreground (no-op non-combo)
     });
+#endif
 
     COND_HOOK(OnPlayerSfx, isConnected, [&](u16 sfxId) { SendPacket_PlayerSfx(sfxId); });
     COND_HOOK(OnOcarinaNote, isConnected,

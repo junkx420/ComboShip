@@ -114,6 +114,11 @@ class Anchor : public Network {
     void HandlePacket_UpdateDungeonItems(nlohmann::json payload);
     void HandlePacket_UpdateRoomState(nlohmann::json payload);
     void HandlePacket_UpdateTeamState(nlohmann::json payload);
+#ifdef COMBO_BUILD
+    // Co-op next (2026-11-13): the version-mismatch filter, run on the game thread when a queue is
+    // drained (it reads `clients`, which the receive thread must not touch). See Anchor.cpp.
+    bool ComboDropForVersionMismatch(const nlohmann::json& payload);
+#endif
 
   public:
     uint32_t ownClientId;

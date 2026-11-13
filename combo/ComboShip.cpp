@@ -971,9 +971,16 @@ static std::queue<std::string> sOutQueue;
 // Which game inbound packets are dispatched to. 0 = OOT, 1 = MM. Updated by the game-switch loop
 // via SetActiveGame on each transition. Phase 3 will route per-packet by TARGET game instead.
 static std::atomic<int> sActiveGame{ 0 };
-// Finding 4: on-connect resync must run on the game thread (RequestResyncDormantSafe touches
-// gPlayState/isDormantApply, which PumpDormant also mutates there). Set here, drained by PumpDormant.
-static std::atomic<bool> sResyncPending{ false };
+// Link state as the GAME thread must see it (co-op next, 2026-11-13). The receive thread never calls
+// into a game's Anchor object any more: it only bumps this counter (odd = socket up, even = down), and
+// the active game's per-frame pump (SyncLinkOnGameThread) applies the change. Connect/disconnect
+// re-register ~45 GameInteractor hooks, send the HANDSHAKE and read gPlayState, none of which is safe
+// next to a running game frame. One counter instead of a flag, so a drop + reconnect between two
+// frames is still seen as "new connection, introduce yourself again". Written under sOutMutex.
+static std::atomic<uint32_t> sLinkEpoch{ 0 };
+// Guarded by sOutMutex. True once this connection's HANDSHAKE is in sOutQueue. The server drops every
+// packet that arrives before the handshake, so until then nothing else may be queued (see Send()).
+static bool sHandshakeQueued = false;
 
 // ---- Co-op hardening (2026-11-13): offline outbox, link-state toasts, presence toasts ----
 // Save-affecting packets that could not go out (disconnected, or a send failed mid-stream) are held
@@ -997,6 +1004,12 @@ static void Toast(const char* prefix, const char* message, const char* suffix, c
     FnComboToast fn = sActiveGame.load() == 1 ? MM_ComboToast : SOH_ComboToast;
     if (fn)
         fn(prefix ? prefix : "", message ? message : "", suffix ? suffix : "", gateCvar);
+}
+
+// Hold sOutMutex. The only place sConnected changes, so sLinkEpoch's parity always matches it.
+static void SetLinkLocked(bool up) {
+    if (sConnected.exchange(up) != up)
+        sLinkEpoch.fetch_add(1);
 }
 
 // Packets worth holding across a disconnect: everything that changes a teammate's save. Their receive
@@ -1107,6 +1120,8 @@ static int FlushOutbox() {
     int sent = 0, dropped = 0;
     {
         std::lock_guard<std::mutex> lk(sOutMutex);
+        if (!sHandshakeQueued)
+            return 0; // the game thread has not introduced this connection yet; the server would drop them
         std::deque<OutboxEntry> keep;
         for (auto& e : sOutbox) {
             if (e.seed == 0 || e.seed == seed) {
@@ -1340,6 +1355,11 @@ static const char* Combo_Anchor_GetRoster() {
 //    within ~30 s and reconnected, instead of hanging "connected" forever;
 //  - host resolution is retried (a DNS hiccup at boot used to disable Anchor for the whole session);
 //  - link toasts: lost / reconnected / held items delivered.
+//
+// Co-op next (2026-11-13): this thread no longer calls SOH_Anchor_OnConnected / OnDisconnected /
+// MM_Anchor_Activate. It only flips the link state (SetLinkLocked); the game thread reacts in
+// SyncLinkOnGameThread. The only game entry points left on this thread are the two RecvJson exports
+// (enqueue under the game's own mutex) and the thread-safe toast.
 constexpr int kPollMs = 5;
 
 // Hold sOutMutex. Everything still queued for a socket that just died: keep the save-affecting part.
@@ -1390,24 +1410,18 @@ static void ReceiveLoop() {
             leftover.swap(sOutQueue);
             HoldUnsentLocked(leftover);
             PersistOutboxLocked();
-            sConnected = true;
         }
         {
             std::lock_guard<std::mutex> lk(sRosterMutex);
             sPresenceSeeded = false; // the first roster of this connection only seeds presence
         }
-        // OOT's OnConnected sends the room HANDSHAKE (establishes our client id) regardless of
-        // which game is foreground. If MM is the active game (e.g. we connected while already in
-        // MM, or resumed straight into it), also activate MM so it announces its presence — MM
-        // otherwise only announces on a transition or scene load, neither of which happens here.
-        if (SOH_Anchor_OnConnected)
-            SOH_Anchor_OnConnected();
-        if (sActiveGame.load() == 1 && MM_Anchor_Activate)
-            MM_Anchor_Activate();
-        // Bug 2: full both-games resync on every (re)connect. Both requests go out unconditionally
-        // (dormant-safe), so a late-joiner/reconnect pulls the peer's OOT AND MM progress, and this
-        // client's own dormant sibling gets asked too. Deferred to the game thread (finding 4).
-        sResyncPending.store(true);
+        {
+            // Go live. The game thread notices the new epoch on its next frame and sends the HANDSHAKE
+            // (SyncLinkOnGameThread); until that is queued, Send() holds or drops everything else.
+            std::lock_guard<std::mutex> lk(sOutMutex);
+            sHandshakeQueued = false;
+            SetLinkLocked(true);
+        }
         Toast("Co-op", reconnect ? "reconnected" : "connected", "", "gRemote.Anchor.PartnerFeed.Connection");
         lostToastShown = false;
 
@@ -1447,7 +1461,7 @@ static void ReceiveLoop() {
                 HoldUnsentLocked(toSend);
                 HoldUnsentLocked(sOutQueue);
                 PersistOutboxLocked();
-                sConnected = false;
+                SetLinkLocked(false);
                 break;
             }
 
@@ -1488,12 +1502,11 @@ static void ReceiveLoop() {
             // Packets the game queued after the last drain would otherwise sit in sOutQueue until the
             // next connection; hold the save-affecting part now so it is persisted.
             std::lock_guard<std::mutex> lk(sOutMutex);
-            sConnected = false;
+            SetLinkLocked(false); // the game thread tells soh's Anchor (SyncLinkOnGameThread)
+            sHandshakeQueued = false;
             HoldUnsentLocked(sOutQueue);
             PersistOutboxLocked();
         }
-        if (SOH_Anchor_OnDisconnected)
-            SOH_Anchor_OnDisconnected();
         if (sEnabled && !lostToastShown) {
             Toast("Co-op", "connection lost", "reconnecting...", "gRemote.Anchor.PartnerFeed.Connection");
             lostToastShown = true;
@@ -1526,10 +1539,14 @@ static void Disconnect() {
     if (!sEnabled)
         return;
     sEnabled = false;
-    sConnected = false;
+    {
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        SetLinkLocked(false);
+    }
     if (sThread.joinable())
         sThread.join();
     std::lock_guard<std::mutex> lk(sOutMutex);
+    sHandshakeQueued = false;
     std::queue<std::string> empty;
     sOutQueue.swap(empty);
     if (sOutboxDirty)
@@ -1545,17 +1562,35 @@ static void Send(const char* json) {
     // Our own scene/room-state is broadcast OUTBOUND (never echoed inbound), so parse it here too or the
     // self roster row would freeze at its join value.
     UpdateRosterFromPacket(json);
+    // Cheap pre-check so the per-frame pose packets never pay for a JSON parse: nlohmann dumps without
+    // whitespace, and a quote inside a string value is escaped, so this text can only be the type key.
+    const bool maybeHandshake = std::strstr(json, "\"type\":\"HANDSHAKE\"") != nullptr;
     std::lock_guard<std::mutex> lk(sOutMutex);
-    if (sConnected) {
+    if (sConnected && sHandshakeQueued && !maybeHandshake) {
         sOutQueue.push(json);
         return;
     }
-    // Co-op hardening (2026-11-13): disconnected. Hold save-affecting packets for the next connection;
-    // drop live-only ones (MM keeps sending poses while offline, which used to pile up unbounded here).
     if (!sEnabled)
         return;
     std::string packet(json);
-    if (IsDurablePacketType(PacketType(packet))) {
+    const std::string type = PacketType(packet);
+    if (type == "HANDSHAKE") {
+        // Exactly one per connection: without a socket there is nobody to greet, and a second one on
+        // the same socket makes the server disconnect "the other session with this client id" — us.
+        if (sConnected && !sHandshakeQueued) {
+            sOutQueue.push(std::move(packet));
+            sHandshakeQueued = true;
+        }
+        return;
+    }
+    if (sConnected && sHandshakeQueued) {
+        sOutQueue.push(std::move(packet));
+        return;
+    }
+    // Co-op hardening (2026-11-13): no usable connection (down, or up but not introduced yet — the
+    // server drops everything before the HANDSHAKE). Hold save-affecting packets for the next flush;
+    // drop live-only ones (MM keeps sending poses while offline, which used to pile up unbounded here).
+    if (IsDurablePacketType(type)) {
         OutboxPushLocked(packet);
         sOutboxDirty = true; // written to disk by the network thread (PersistOutboxIfDirty), not here
     }
@@ -1580,6 +1615,36 @@ static void SetActiveGame(int game /* 0 = OOT, 1 = MM */) {
         if (MM_Anchor_Deactivate)
             MM_Anchor_Deactivate();
     }
+}
+
+// Game thread, once per frame (first thing in PumpDormant). Applies link changes the receive thread
+// only recorded in sLinkEpoch:
+//  - down: soh's Anchor drops its connected-only hooks;
+//  - up:   OOT's OnConnected sends the room HANDSHAKE (establishes our client id) whichever game is
+//          foreground. If MM is the active game (connected while already in MM, or resumed straight
+//          into it), MM is activated too so it announces its presence — it otherwise only announces on
+//          a transition or scene load. Then the full both-games resync (bug 2): both requests go out
+//          unconditionally (dormant-safe), so a late joiner/reconnect pulls the peer's OOT AND MM
+//          progress, and this client's own dormant sibling gets asked too.
+// A drop + reconnect between two frames shows up as a jump by 2: down and up are both replayed.
+static void SyncLinkOnGameThread() {
+    static uint32_t sAppliedEpoch = 0; // game thread only
+    const uint32_t epoch = sLinkEpoch.load();
+    if (epoch == sAppliedEpoch)
+        return;
+    if ((sAppliedEpoch & 1) != 0 && SOH_Anchor_OnDisconnected)
+        SOH_Anchor_OnDisconnected();
+    sAppliedEpoch = epoch;
+    if ((epoch & 1) == 0)
+        return;
+    if (SOH_Anchor_OnConnected)
+        SOH_Anchor_OnConnected();
+    if (sActiveGame.load() == 1 && MM_Anchor_Activate)
+        MM_Anchor_Activate();
+    if (SOH_Anchor_RequestResync)
+        SOH_Anchor_RequestResync();
+    if (MM_Anchor_RequestResync)
+        MM_Anchor_RequestResync();
 }
 } // namespace ComboAnchor
 
@@ -1632,13 +1697,9 @@ static void DeliverCrossItem(int targetGame, const char* itemName, const char* s
 // save-affecting co-op packets to the DORMANT game on the caller's (game) thread, so a teammate's
 // collection registers in the dormant game's save live instead of only on next entry.
 static void PumpDormant() {
-    // Finding 4: drain the on-connect resync here (game thread), once per connect.
-    if (ComboAnchor::sResyncPending.exchange(false)) {
-        if (SOH_Anchor_RequestResync)
-            SOH_Anchor_RequestResync();
-        if (MM_Anchor_RequestResync)
-            MM_Anchor_RequestResync();
-    }
+    // Connect/disconnect reactions (handshake, hook re-registration, on-connect resync) run here, on
+    // the game thread, never on the receive thread.
+    ComboAnchor::SyncLinkOnGameThread();
     if (ComboAnchor::sActiveGame.load() == 1) {
         if (SOH_Anchor_PumpDormant)
             SOH_Anchor_PumpDormant(); // MM foreground -> apply to dormant OOT
