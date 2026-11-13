@@ -58,6 +58,13 @@ jobs:
       # then the combo targets. -j 4 caps peak memory: some soh/2ship TUs are
       # >1 GB each at peak, and the 16 GB standard runner OOMs before Ninja's default parallelism
       # helps (locally 20 jobs OOM'd a 21 GB machine).
+      # Co-op unit tests (combo/net: outbox rules, no game code). Seconds to build, so they run first
+      # and a logic regression fails the job before the long game build. Exit code is the verdict.
+      - name: Co-op unit tests (combo_anchor_tests)
+        run: |
+          cmake --build build-cmake --target combo_anchor_tests -j 4
+          ./build-cmake/combo/combo_anchor_tests
+
       - name: Build libultraship
         run: cmake --build build-cmake --target libultraship -j 4
       - name: Build soh

@@ -41,6 +41,7 @@
 #include "rando/CrossWorldRando.h"
 #include "rando/ComboPlaythrough.h"
 #include "rando/CrossHints.h"
+#include "net/ComboAnchorOutbox.h" // co-op outbox rules (pure logic, unit-tested in combo/tests)
 #include "gui/ComboGenProgress.h"
 #include "ComboExtract.h"
 #include "ComboSettingsImport.h"
@@ -983,22 +984,31 @@ static std::atomic<uint32_t> sLinkEpoch{ 0 };
 static bool sHandshakeQueued = false;
 
 // ---- Co-op hardening (2026-11-13): offline outbox, link-state toasts, presence toasts ----
-// Save-affecting packets that could not go out (disconnected, or a send failed mid-stream) are held
-// here instead of being dropped, and flushed after the next handshake. Guarded by sOutMutex.
-// Live-only packets (pose, sfx, presence) are dropped while disconnected — replaying them is useless.
-struct OutboxEntry {
-    uint32_t seed = 0;  // g_loadedMasterSeed when held; 0 = unknown (memory only, never persisted)
-    int64_t heldAt = 0; // unix seconds
-    std::string packet; // the exact JSON the game handed to Send()
-};
+// Save-affecting packets that could not go out (disconnected, not introduced to the server yet, or a
+// send failed mid-stream) are held here instead of being dropped, and flushed once the connection is
+// usable again. Guarded by sOutMutex. Live-only packets (pose, sfx, presence) are dropped — replaying
+// them is useless. The rules themselves (what is held, when an entry may go out, the disk format) are
+// plain functions in combo/net/ComboAnchorOutbox.h so they can be tested without a socket.
+namespace Core = ComboAnchorCore;
+using Core::OutboxEntry;
 static std::deque<OutboxEntry> sOutbox;
 static std::atomic<int> sOutboxCount{ 0 };        // for the network panel, no lock needed
 static std::atomic<bool> sEverConnected{ false }; // since Connect(): tells a reconnect from the first connect
 static bool sOutboxDiskLoaded = false;            // disk outbox read once per process (guarded by sOutMutex)
 static bool sOutboxDirty = false;                 // memory outbox newer than the disk copy (guarded by sOutMutex)
 static bool sPresenceSeeded = false;              // guarded by sRosterMutex; first roster after connect only seeds
-constexpr int64_t kOutboxMaxAgeSeconds = 48 * 60 * 60;
-constexpr size_t kOutboxMaxEntries = 4096; // a runaway flag loop must not grow this without bound
+// Guarded by sOutMutex. "host:port/roomId" of the room this session last introduced itself to (taken
+// from our own HANDSHAKE as it passes through Send()); empty until the first handshake after Connect().
+// Stamped on every held packet, so a find held for one room is never delivered into another one.
+static std::string sScope;
+// Guarded by sOutMutex. When this connection's HANDSHAKE was queued (bounds the wait below).
+static std::chrono::steady_clock::time_point sHandshakeAt;
+// Our client id as the server confirmed it on THIS connection (self entry of ALL_CLIENT_STATE), 0 until
+// then. Held packets are restamped with it before they go out: see Core::RestampClientId.
+static std::atomic<uint32_t> sOwnIdThisConn{ 0 };
+// The roster normally arrives right behind the handshake. If it never does, flush anyway after this
+// long (unstamped) rather than holding progress back for the whole connection.
+constexpr int kFlushOwnIdWaitSeconds = 10;
 
 static void Toast(const char* prefix, const char* message, const char* suffix, const char* gateCvar) {
     FnComboToast fn = sActiveGame.load() == 1 ? MM_ComboToast : SOH_ComboToast;
@@ -1012,37 +1022,28 @@ static void SetLinkLocked(bool up) {
         sLinkEpoch.fetch_add(1);
 }
 
-// Packets worth holding across a disconnect: everything that changes a teammate's save. Their receive
-// paths are already idempotent or progressive (see docs/deviations/anchor.md), and none of them is
-// time-sensitive. UPDATE_TEAM_STATE is not held: it is a full snapshot that the next save re-sends.
-static bool IsDurablePacketType(const std::string& t) {
-    return t == "GIVE_ITEM" || t == "COMBO_CROSS_ITEM" || t == "SET_FLAG" || t == "UNSET_FLAG" ||
-           t == "SET_CHECK_STATUS" || t == "UPDATE_DUNGEON_ITEMS" || t == "UPDATE_BEANS_COUNT" ||
-           t == "ENTRANCE_DISCOVERED" || t == "GAME_COMPLETE";
-}
-
-static std::string PacketType(const std::string& packet) {
-    try {
-        return nlohmann::json::parse(packet).value("type", std::string());
-    } catch (...) { return std::string(); }
-}
-
 static std::filesystem::path OutboxPath() {
     return ComboRando::SaveDir() / "coop-outbox.json";
 }
 
-// Hold sOutMutex. Persist the seed-scoped entries (temp + rename, like the save container). An entry
-// with an unknown seed stays memory-only: it could not be scoped safely on a later run.
-static void PersistOutboxLocked() {
-    sOutboxDirty = false;
+// Write the seed-scoped entries to disk (temp + rename, like the save container) if the memory outbox
+// changed since the last write. Only the JSON text is built under sOutMutex; the file IO happens after
+// the lock is released, so the game thread's Send() never waits for the disk. Callers: the receive
+// thread, and Disconnect() after that thread was joined — never two at once, so writes stay in order.
+static void PersistOutboxIfDirty() {
+    std::string text; // empty = nothing persistable left: remove the file
+    {
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        if (!sOutboxDirty)
+            return;
+        sOutboxDirty = false;
+        const nlohmann::json file = Core::OutboxToJson(sOutbox);
+        if (!file["entries"].empty())
+            text = file.dump();
+    }
     std::error_code ec;
     const auto path = OutboxPath();
-    nlohmann::json entries = nlohmann::json::array();
-    for (const auto& e : sOutbox) {
-        if (e.seed != 0)
-            entries.push_back({ { "seed", e.seed }, { "heldAt", e.heldAt }, { "packet", e.packet } });
-    }
-    if (entries.empty()) {
+    if (text.empty()) {
         std::filesystem::remove(path, ec);
         return;
     }
@@ -1055,21 +1056,13 @@ static void PersistOutboxLocked() {
             std::cerr << "[ComboShip][Anchor] cannot write " << path << " (held co-op items stay in memory)\n";
             return;
         }
-        out << nlohmann::json{ { "version", 1 }, { "entries", entries } }.dump();
+        out << text;
     }
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
         std::filesystem::remove(path, ec);
         std::filesystem::rename(tmp, path, ec);
     }
-}
-
-// Network thread / shutdown: write the outbox if Send() added to it since the last write. Keeps disk IO
-// off the game thread (a flag-heavy area while offline would otherwise rewrite the file per flag).
-static void PersistOutboxIfDirty() {
-    std::lock_guard<std::mutex> lk(sOutMutex);
-    if (sOutboxDirty)
-        PersistOutboxLocked();
 }
 
 // Hold sOutMutex. Read packets a previous run held but never delivered (quit while offline).
@@ -1083,65 +1076,55 @@ static void LoadOutboxFromDiskLocked() {
     try {
         nlohmann::json j;
         in >> j;
-        const int64_t now = (int64_t)std::time(nullptr);
-        size_t loaded = 0;
-        for (const auto& e : j.value("entries", nlohmann::json::array())) {
-            OutboxEntry entry;
-            entry.seed = e.value("seed", 0u);
-            entry.heldAt = e.value("heldAt", (int64_t)0);
-            entry.packet = e.value("packet", std::string());
-            if (entry.seed == 0 || entry.packet.empty() || now - entry.heldAt > kOutboxMaxAgeSeconds)
-                continue;
-            sOutbox.push_back(std::move(entry));
-            loaded++;
-        }
+        const size_t loaded = Core::OutboxFromJson(j, sOutbox, (int64_t)std::time(nullptr));
         std::cout << "[ComboShip][Anchor] restored " << loaded << " held co-op packet(s) from disk" << std::endl;
     } catch (...) { std::cerr << "[ComboShip][Anchor] ignoring unreadable co-op outbox file\n"; }
     sOutboxCount.store((int)sOutbox.size());
 }
 
-// Hold sOutMutex.
+// Hold sOutMutex. The disk copy is brought up to date by the receive thread (PersistOutboxIfDirty).
 static void OutboxPushLocked(const std::string& packet) {
-    if (sOutbox.size() >= kOutboxMaxEntries) {
-        std::cerr << "[ComboShip][Anchor] co-op outbox full, dropping oldest held packet\n";
-        sOutbox.pop_front();
-    }
-    sOutbox.push_back({ g_loadedMasterSeed.load(), (int64_t)std::time(nullptr), packet });
+    OutboxEntry entry;
+    entry.seed = g_loadedMasterSeed.load();
+    entry.heldAt = (int64_t)std::time(nullptr);
+    entry.scope = sScope;
+    entry.packet = packet;
+    if (Core::OutboxPush(sOutbox, std::move(entry)))
+        std::cerr << "[ComboShip][Anchor] co-op outbox full, dropped the oldest held packet\n";
     sOutboxCount.store((int)sOutbox.size());
+    sOutboxDirty = true;
 }
 
-// Network thread, while connected and after the handshake: move held packets of the loaded playthrough
-// into the send queue. Entries of another seed are dropped; entries whose seed can't be judged yet (no
-// slot loaded) wait. Returns how many were queued for sending.
+// Network thread, while connected: move the held packets that belong to this room and to the loaded
+// playthrough into the send queue (rules: Core::OutboxTakeSendable). Waits for the HANDSHAKE (the
+// server drops anything before it) and for the server to confirm our client id, so the packets can be
+// restamped with it. Entries of another save slot or room stay held. Returns how many were queued.
 static int FlushOutbox() {
     if (sOutboxCount.load() == 0)
         return 0;
     const uint32_t seed = g_loadedMasterSeed.load();
-    int sent = 0, dropped = 0;
+    const uint32_t ownId = sOwnIdThisConn.load();
+    size_t sent = 0, expired = 0;
     {
         std::lock_guard<std::mutex> lk(sOutMutex);
         if (!sHandshakeQueued)
-            return 0; // the game thread has not introduced this connection yet; the server would drop them
-        std::deque<OutboxEntry> keep;
-        for (auto& e : sOutbox) {
-            if (e.seed == 0 || e.seed == seed) {
-                sOutQueue.push(std::move(e.packet));
-                sent++;
-            } else if (seed != 0) {
-                dropped++; // held for a different playthrough than the one now loaded
-            } else {
-                keep.push_back(std::move(e)); // no slot loaded yet: can't tell, keep waiting
-            }
-        }
-        sOutbox.swap(keep);
+            return 0; // the game thread has not introduced this connection yet
+        if (ownId == 0 &&
+            std::chrono::steady_clock::now() - sHandshakeAt < std::chrono::seconds(kFlushOwnIdWaitSeconds))
+            return 0; // roster not here yet
+        Core::OutboxFlush flush = Core::OutboxTakeSendable(sOutbox, seed, sScope, ownId, (int64_t)std::time(nullptr));
+        sent = flush.send.size();
+        expired = flush.expired;
+        for (auto& p : flush.send)
+            sOutQueue.push(std::move(p));
         sOutboxCount.store((int)sOutbox.size());
-        if (sent != 0 || dropped != 0)
-            PersistOutboxLocked();
+        if (sent != 0 || expired != 0)
+            sOutboxDirty = true;
     }
-    if (sent != 0 || dropped != 0)
-        std::cout << "[ComboShip][Anchor] outbox flush: " << sent << " sent, " << dropped << " dropped (other seed)"
-                  << std::endl;
-    return sent;
+    if (sent != 0 || expired != 0)
+        std::cout << "[ComboShip][Anchor] outbox flush: " << sent << " sent, " << expired << " expired, "
+                  << sOutboxCount.load() << " still held (other slot/room)" << std::endl;
+    return (int)sent;
 }
 
 // Combo-owned Anchor roster/presence. A game's Anchor only drains packets while it's the foreground
@@ -1226,8 +1209,10 @@ static void UpdateRosterFromPacket(const std::string& packet) {
             for (auto& c : pj.value("state", nlohmann::json::array())) {
                 ClientInfo info;
                 ParseClient(c, "", info); // array entries carry no originGame; sceneNum tags MM
-                if (c.value("self", false))
+                if (c.value("self", false)) {
                     sOwnClientId = info.clientId;
+                    sOwnIdThisConn.store(info.clientId); // unblocks FlushOutbox (restamp with this id)
+                }
                 if (!c.contains("online")) { // no presence info in this entry: keep the last known flag
                     auto p = prev.find(info.clientId);
                     info.online = p != prev.end() && p->second.online;
@@ -1361,11 +1346,12 @@ static const char* Combo_Anchor_GetRoster() {
 // SyncLinkOnGameThread. The only game entry points left on this thread are the two RecvJson exports
 // (enqueue under the game's own mutex) and the thread-safe toast.
 constexpr int kPollMs = 5;
+constexpr int kOutboxCheckMs = 250;
 
 // Hold sOutMutex. Everything still queued for a socket that just died: keep the save-affecting part.
 static void HoldUnsentLocked(std::queue<std::string>& unsent) {
     while (!unsent.empty()) {
-        if (IsDurablePacketType(PacketType(unsent.front())))
+        if (Core::IsDurablePacketType(Core::PacketType(unsent.front())))
             OutboxPushLocked(unsent.front());
         unsent.pop();
     }
@@ -1409,12 +1395,13 @@ static void ReceiveLoop() {
             std::queue<std::string> leftover;
             leftover.swap(sOutQueue);
             HoldUnsentLocked(leftover);
-            PersistOutboxLocked();
         }
+        PersistOutboxIfDirty();
         {
             std::lock_guard<std::mutex> lk(sRosterMutex);
             sPresenceSeeded = false; // the first roster of this connection only seeds presence
         }
+        sOwnIdThisConn.store(0); // not confirmed for this connection yet
         {
             // Go live. The game thread notices the new epoch on its next frame and sends the HANDSHAKE
             // (SyncLinkOnGameThread); until that is queued, Send() holds or drops everything else.
@@ -1427,13 +1414,20 @@ static void ReceiveLoop() {
 
         SDLNet_SocketSet set = SDLNet_AllocSocketSet(1);
         SDLNet_TCP_AddSocket(set, socket);
+        auto nextOutboxCheck = std::chrono::steady_clock::now();
 
         while (sEnabled && sConnected) {
-            // Held packets go out right behind the HANDSHAKE (queued by OnConnected above), once the
-            // loaded slot proves they belong to this playthrough.
-            if (int flushed = FlushOutbox(); flushed > 0) {
-                std::string n = std::to_string(flushed) + (flushed == 1 ? " held update" : " held updates");
-                Toast("Co-op", "sent", n.c_str(), "gRemote.Anchor.PartnerFeed.Connection");
+            // Held packets go out once the game thread has queued the HANDSHAKE, the server has
+            // confirmed our client id, and the loaded slot proves they belong to this playthrough.
+            // Checked a few times per second, not per 5 ms spin: entries of another slot or room can
+            // sit here for hours.
+            if (const auto tick = std::chrono::steady_clock::now(); tick >= nextOutboxCheck) {
+                nextOutboxCheck = tick + std::chrono::milliseconds(kOutboxCheckMs);
+                if (int flushed = FlushOutbox(); flushed > 0) {
+                    std::string n = std::to_string(flushed) + (flushed == 1 ? " held update" : " held updates");
+                    Toast("Co-op", "sent", n.c_str(), "gRemote.Anchor.PartnerFeed.Connection");
+                }
+                PersistOutboxIfDirty(); // also covers packets Send() held while waiting for the handshake
             }
 
             // Drain outbound queue (packets handed to us by the game via Send()).
@@ -1460,9 +1454,8 @@ static void ReceiveLoop() {
                 std::lock_guard<std::mutex> lk(sOutMutex);
                 HoldUnsentLocked(toSend);
                 HoldUnsentLocked(sOutQueue);
-                PersistOutboxLocked();
                 SetLinkLocked(false);
-                break;
+                break; // persisted below, after the socket is closed
             }
 
             // Wait briefly for inbound data (also paces this loop; outbound latency stays <= kPollMs).
@@ -1505,8 +1498,8 @@ static void ReceiveLoop() {
             SetLinkLocked(false); // the game thread tells soh's Anchor (SyncLinkOnGameThread)
             sHandshakeQueued = false;
             HoldUnsentLocked(sOutQueue);
-            PersistOutboxLocked();
         }
+        PersistOutboxIfDirty();
         if (sEnabled && !lostToastShown) {
             Toast("Co-op", "connection lost", "reconnecting...", "gRemote.Anchor.PartnerFeed.Connection");
             lostToastShown = true;
@@ -1527,6 +1520,12 @@ static void Connect(const char* host, uint16_t port) {
     }
     sHost = host ? host : "";
     sPort = port;
+    {
+        // The room is not known until our HANDSHAKE passes through Send(); packets held before that
+        // carry no scope and are adopted by the room that handshake names.
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        sScope.clear();
+    }
     sEverConnected = false;
     sEnabled = true;
     if (sThread.joinable())
@@ -1545,14 +1544,17 @@ static void Disconnect() {
     }
     if (sThread.joinable())
         sThread.join();
-    std::lock_guard<std::mutex> lk(sOutMutex);
-    sHandshakeQueued = false;
-    std::queue<std::string> empty;
-    sOutQueue.swap(empty);
-    if (sOutboxDirty)
-        PersistOutboxLocked(); // held while the loop was already gone (or between its last write and exit)
-    // The outbox is kept (memory + disk): turning co-op off and on again, or quitting, must not lose
-    // progress a teammate hasn't received yet. It is flushed on the next connection to this seed.
+    {
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        sHandshakeQueued = false;
+        std::queue<std::string> empty;
+        sOutQueue.swap(empty);
+    }
+    // Held while the loop was already gone (or between its last write and exit). The receive thread is
+    // joined, so this is the only writer. The outbox itself is kept (memory + disk): turning co-op off
+    // and on again, or quitting, must not lose progress a teammate hasn't received yet. It is flushed
+    // on the next connection to this room with this seed loaded.
+    PersistOutboxIfDirty();
 }
 
 // Registered into the game as the send callback (Network::SendDataToRemote redirects here).
@@ -1573,13 +1575,19 @@ static void Send(const char* json) {
     if (!sEnabled)
         return;
     std::string packet(json);
-    const std::string type = PacketType(packet);
+    const std::string type = Core::PacketType(packet);
     if (type == "HANDSHAKE") {
         // Exactly one per connection: without a socket there is nobody to greet, and a second one on
         // the same socket makes the server disconnect "the other session with this client id" — us.
         if (sConnected && !sHandshakeQueued) {
+            // It names the room: that is the scope of everything held from now on, and of what was
+            // held on the way here.
+            sScope = Core::MakeScope(sHost, sPort, Core::HandshakeRoomId(packet));
+            if (Core::OutboxAdoptScope(sOutbox, sScope) != 0)
+                sOutboxDirty = true;
             sOutQueue.push(std::move(packet));
             sHandshakeQueued = true;
+            sHandshakeAt = std::chrono::steady_clock::now();
         }
         return;
     }
@@ -1590,10 +1598,8 @@ static void Send(const char* json) {
     // Co-op hardening (2026-11-13): no usable connection (down, or up but not introduced yet — the
     // server drops everything before the HANDSHAKE). Hold save-affecting packets for the next flush;
     // drop live-only ones (MM keeps sending poses while offline, which used to pile up unbounded here).
-    if (IsDurablePacketType(type)) {
-        OutboxPushLocked(packet);
-        sOutboxDirty = true; // written to disk by the network thread (PersistOutboxIfDirty), not here
-    }
+    if (Core::IsDurablePacketType(type))
+        OutboxPushLocked(packet); // written to disk by the network thread (PersistOutboxIfDirty), not here
 }
 
 // Called during launcher shutdown, BEFORE any game DLL is unloaded: the receive thread calls

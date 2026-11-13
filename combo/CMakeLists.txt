@@ -146,6 +146,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     )
 endif()
 
+# ComboShip co-op: unit tests for the launcher's pure Anchor logic (combo/net/, header-only). Needs
+# neither game DLL nor SDL, only nlohmann_json, so it builds in seconds. EXCLUDE_FROM_ALL like
+# comborando; the Linux CI job builds and runs it before the game targets (exit code = verdict).
+add_executable(combo_anchor_tests EXCLUDE_FROM_ALL tests/ComboAnchorOutboxTest.cpp)
+target_include_directories(combo_anchor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(combo_anchor_tests PRIVATE nlohmann_json::nlohmann_json)
+
 # Windows-specific settings
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     # Icon + version info for ComboShip.exe; the version is COMBO_RELEASE_VERSION padded to 4 parts.

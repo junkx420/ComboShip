@@ -933,7 +933,7 @@ void DrawNetworkSharedPanel() {
         if (held > 0) {
             ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.3f, 1.0f), "%d update%s held for teammates", held,
                                held == 1 ? "" : "s");
-            ImGui::SetItemTooltip("%s", connected ? "Sent as soon as the save slot of this seed is loaded."
+            ImGui::SetItemTooltip("%s", connected ? "Sent once their save slot is loaded in their room."
                                                   : "Sent automatically once the connection is back. Nothing is "
                                                     "lost if you quit: they are kept on disk.");
         }
