@@ -152,6 +152,7 @@ class MMAnchor {
     void HandlePacket_PartnerFind(const nlohmann::json& payload); // live partner feed (toast only)
     void ApplyDormantGiveItem(const nlohmann::json& payload);     // A6: dormant-safe co-op item apply
     void HandlePacket_UpdateTeamState(nlohmann::json& payload);   // mutates payload (rando check unpack)
+    void ReplayTeamStateQueue(const nlohmann::json& payload);     // co-op next: the "queue" of a team state
     void HandlePacket_RequestTeamState(const nlohmann::json& payload);
     // Co-op next (2026-11-13): honour the room's "sync items and flags" setting (foreground + dormant).
     void HandlePacket_UpdateRoomState(const nlohmann::json& payload);

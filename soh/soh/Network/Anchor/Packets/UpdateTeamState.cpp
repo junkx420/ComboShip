@@ -138,6 +138,20 @@ void Anchor::HandlePacket_UpdateTeamState(nlohmann::json payload) {
     // ComboShip: MM's UPDATE_TEAM_STATE has a different state shape; from_json would throw
     // mid-handler and leave isHandlingUpdateTeamState stuck true (muting check-status sync).
     if (payload.contains("state") && !payload["state"].contains("healthCapacity")) {
+        // Co-op next block 2 (2026-11-14): the STATE is not ours, but the queue riding along is the
+        // team's: packets the server collected for whoever asks. The server has one state slot per
+        // team, so after a teammate's MM save every reply looks like this, and returning here threw
+        // the queued OOT finds away with it. Replay them; handlers skip what is not OOT-shaped.
+        if (payload.contains("queue") && payload["queue"].is_array()) {
+            std::lock_guard<std::mutex> lock(incomingPacketQueueMutex);
+            for (auto& item : payload["queue"]) {
+                try {
+                    incomingPacketQueue.push(nlohmann::json::parse(item.get<std::string>()));
+                } catch (const std::exception& e) {
+                    SPDLOG_ERROR("[Anchor] failed to parse queued team-state packet: {}", e.what());
+                }
+            }
+        }
         return;
     }
 #endif

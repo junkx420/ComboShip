@@ -936,12 +936,37 @@ void MMAnchor::SendTeamStateFromSave(const std::string& targetTeamId) {
     SendJson(payload);
 }
 
-void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
-    if (!roomState.syncItemsAndFlags || !payload.contains("state")) {
+// Co-op next block 2 (2026-11-14): replay the packets the server queued for the team (they ride in an
+// UPDATE_TEAM_STATE's "queue") through the normal incoming path. Split out of the handler below so the
+// queue is no longer lost whenever the STATE next to it is not usable: the server has one state slot
+// per team, so after a teammate's OOT save every reply carries an OOT-shaped state (or none at all,
+// before anyone saved), and the old early returns dropped the queued MM finds with it.
+void MMAnchor::ReplayTeamStateQueue(const nlohmann::json& payload) {
+    auto queue = payload.find("queue");
+    if (queue == payload.end() || !queue->is_array()) {
         return;
     }
-    if (!payload["state"].contains("shipSaveInfo")) {
-        return; // soh-shaped team state; from_json(Save) would throw
+    std::lock_guard<std::mutex> lock(incomingMutex);
+    for (const auto& item : *queue) {
+        try {
+            incomingQueue.push(nlohmann::json::parse(item.get<std::string>()));
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("[MMAnchor] failed to parse queued team-state packet: {}", e.what());
+        }
+    }
+}
+
+void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
+    if (!roomState.syncItemsAndFlags) {
+        return;
+    }
+    if (!payload.contains("state") || !payload["state"].contains("shipSaveInfo")) {
+        // No state, or a soh-shaped one (from_json(Save) would throw). The queue is still ours to
+        // replay — into a real save only (the dormant GIVE_ITEM apply has its own gates).
+        if (HasLoadedRandoSave()) {
+            ReplayTeamStateQueue(payload);
+        }
+        return;
     }
     // ComboShip: both guards must hold on the dormant path too (PumpDormant persists right after), so
     // neither may be conditioned on IS_RANDO. No vanilla mode here: a non-rando local save means nothing
@@ -1196,16 +1221,7 @@ void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
     }
 
     // Replay any packets queued on the server while we were away, through the normal incoming path.
-    if (payload.contains("queue") && payload["queue"].is_array()) {
-        std::lock_guard<std::mutex> lock(incomingMutex);
-        for (auto& item : payload["queue"]) {
-            try {
-                incomingQueue.push(nlohmann::json::parse(item.get<std::string>()));
-            } catch (const std::exception& e) {
-                SPDLOG_ERROR("[MMAnchor] failed to parse queued team-state packet: {}", e.what());
-            }
-        }
-    }
+    ReplayTeamStateQueue(payload);
 }
 
 // MARK: - Same-game teleport (mirrors soh's REQUEST_TELEPORT -> TELEPORT_TO handshake)
