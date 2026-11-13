@@ -613,3 +613,75 @@ still lost, as before; the next save's `UPDATE_TEAM_STATE` covers it).
   absences, and the `addToQueue` notes above overstate it; the real safety net is the union resync when
   both players are online. Splitting the team state per game is block 2.
 - MM flag sync is unchanged (block 3).
+
+## Co-op next, block 2: packet ids, server acknowledgement, team-state requests and queue (2026-11-14)
+
+**Why:** block 1 left "a packet the OS accepted just before the link died is lost", and a direct read of
+the relay server (`garrettjoecox/anchor`, `client.go` / `team.go`) showed three more defects in how the
+fork uses it.
+
+1. **A resync lost one game.** `REQUEST_TEAM_STATE` appends the requester to
+   `team.clientIdsRequestingState`; the *first* `UPDATE_TEAM_STATE` the server then sees is sent to
+   every id in that list (once per entry) and the list is emptied. OOT and MM each send a request, back
+   to back, so the list held the requester twice: the first answer (one game) was delivered twice, the
+   second answer (the other game) to nobody. (The doubled first answer probably also fed the "toast
+   fires 2-3x" burst that the 2026-07-17 entry debounced; not measured.)
+2. **The team queue was replayed once per request.** With no teammate online the server answers every
+   request itself with the stored state plus the whole `addToQueue` queue. Two requests, two identical
+   queues, and each game replays what it is given: an OOT `GIVE_ITEM` in the queue was granted twice.
+3. **The queue was dropped with an unusable state.** One state slot per team, shared by both games.
+   OOT returned before the replay when the state was MM-shaped, MM when it was OOT-shaped or missing.
+4. **No acknowledgement.** A packet written to a socket that died before the server read it was gone
+   (the known gap from the hardening entry).
+
+**Launcher (`combo/ComboShip.cpp`, rules in `combo/net/ComboAnchorDelivery.h`; combo-owned):**
+- **Packet ids.** `Send()` stamps every save-affecting packet (`IsDurablePacketType`) with a unique
+  `comboPid` (random per-process prefix + counter), once; the id survives the outbox, the disk and
+  re-sends. `AcceptInbound` (receive thread, before the packet reaches either game) drops a packet
+  whose id was already passed on, and removes such entries from the `queue` of an `UPDATE_TEAM_STATE`
+  (`FilterTeamStateQueue`; the packet is re-serialized only if something was removed). The id memory
+  (`SeenIds`, 8192 ids) is cleared in `LoadComboCompletion`, i.e. whenever a save slot is loaded: from
+  then on the games hold the file's state again and a replay must get through.
+- **Server acknowledgement without a server change.** The relay delivers a packet that has
+  `targetClientId` to that client only, also when it is the sender. After writing save-affecting
+  packets the receive thread writes `COMBO_ACK_MARK {targetClientId: own, n}`; TCP keeps the order, so
+  when marker `n` comes back, everything written before it has reached the server (`InFlight`). What is
+  still unconfirmed when the connection ends is put back at the front of the outbox and re-sent on the
+  next connection, under the same ids. Re-holding starts only after this server has echoed one marker
+  (`sMarkerProven`), and markers need the client id the server confirmed, like the outbox flush.
+- **One team-state request at a time.** `TeamStateRequestGate` in `Send()`: while a request is on the
+  wire, the same game's next request is dropped as redundant and the other game's is parked; it goes
+  out when an `UPDATE_TEAM_STATE` arrives or after 3 s. Covers every source at once (on-connect
+  resync, the menu button, each game's own on-load request, the dormant-peek request).
+- `Send()` now has three text pre-checks (handshake, durable types, team-state request); everything
+  else, i.e. all per-frame traffic, still takes the path without a JSON parse.
+
+**soh (`COMBO_BUILD`):** `Packets/UpdateTeamState.cpp` — the "state is MM-shaped" early return replays
+the queue first.
+
+**MM (`MMAnchor.{h,cpp}`):** `ReplayTeamStateQueue`, called from the "no state / soh-shaped state" early
+return (only with a loaded rando save) and from the normal path.
+
+**Wire compatibility:** `comboPid` is one extra field; older fork builds and plain SoH Anchor ignore it
+and are not deduplicated against (they behave as before). `COMBO_ACK_MARK` is addressed to its own
+sender, so no other client ever receives it. Packets without an id pass every check untouched.
+
+**Tests:** `combo/tests/ComboAnchorDeliveryTest.cpp` (pre-checks stay in step with the durable list,
+ids, `SeenIds`, queue filter, ack mark, `InFlight`, the request gate), same `combo_anchor_tests` target.
+
+**Limits / not covered:**
+- The acknowledgement says "the server has it", not "the teammate applied it". A teammate that is
+  offline still depends on the server queue (minutes, see block 1) and the union resync.
+- A re-sent packet can still be applied twice by a receiver that applied the first copy, saved, and
+  loaded a slot (id memory cleared) before the re-send arrived. Only OOT's `GIVE_ITEM` is affected; MM
+  items and cross items are idempotent per check. Needs the sender's connection to die inside the
+  marker round trip *and* the receiver to reload meanwhile.
+- A packet dropped by the game itself (e.g. no save loaded at that moment) still counts as passed on
+  until the next slot load.
+- Re-held packets get the seed and room scope current at re-hold time, not at first send.
+- Queue entries from builds without ids are still replayed once per reply.
+- **Deliberately not done: a per-game team-state slot on the server.** A second team id would have no
+  members, so the server would never forward its requests to live teammates; and rooms (state + queue)
+  are deleted after 5 minutes without activity anyway. With requests serialized and the queue no longer
+  tied to the state shape, the remaining loss is "the other game's *stored* state while no teammate is
+  online", which the next both-online resync repairs.
