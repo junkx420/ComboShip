@@ -431,3 +431,92 @@ silence.
 - **Toggles** in the combo Shared > Settings > Network panel (`combo/gui/ComboMenu.cpp`), both default on,
   local display only: `gRemote.Anchor.PartnerFeed.Finds` (COMBO_PARTNER_FIND toasts) and
   `gRemote.Anchor.PartnerFeed.GameSwitch`.
+
+
+## Co-op hardening: connection, held updates, backups, toasts (2026-11-13)
+
+**Why:** a pre-session review of the launcher-owned connection found that nothing protected progress
+across a network hiccup, and that the receive loop itself was expensive:
+
+- `ReceiveLoop` polled `SDLNet_CheckSockets(set, 0)` and `continue`d on "no data", spinning one CPU core
+  at 100% for the whole session.
+- `SDLNet_TCP_Send`'s result was ignored: a failed send silently lost the packet (possibly an item).
+- A dead link (Wi-Fi drop, router reset) was never noticed without outbound traffic; a failed DNS lookup
+  at boot disabled Anchor for the whole session.
+- While disconnected, OOT dropped every packet in `SendJsonToRemote` and unregistered its progress hooks,
+  so finds made then never reached the teammate (until a later save); MM kept handing its per-frame
+  `PLAYER_UPDATE`s to the launcher, where they piled up unbounded and were replayed as a stale burst.
+- MM `GIVE_ITEM` and both games' `COMBO_CROSS_ITEM` had no `addToQueue`, so a teammate who was offline at
+  that moment never received them (soh's `GIVE_ITEM`/flags/check status already had it).
+
+**Launcher (`combo/ComboShip.cpp`, `ComboAnchor`; combo-owned):**
+- Receive loop waits `kPollMs` (5 ms) for inbound data instead of spinning; recv buffer 512 -> 4096.
+- **Offline outbox.** `Send()` while disconnected keeps save-affecting packets (`IsDurablePacketType`:
+  `GIVE_ITEM`, `COMBO_CROSS_ITEM`, `SET_FLAG`, `UNSET_FLAG`, `SET_CHECK_STATUS`, `UPDATE_DUNGEON_ITEMS`,
+  `UPDATE_BEANS_COUNT`, `ENTRANCE_DISCOVERED`, `GAME_COMPLETE`) and drops live-only ones. A short send
+  ends the connection and holds the failed packet plus everything queued behind it. Packets left in the
+  send queue when a connection ends are held the same way. On the next connection the outbox is flushed
+  right behind the `HANDSHAKE`. `UPDATE_TEAM_STATE` is deliberately not held (full snapshot, re-sent on
+  the next save).
+- **Seed scope.** Each held packet records `g_loadedMasterSeed` (the loaded slot's `combo.rando.masterSeed`,
+  set in `LoadComboCompletion`). Flush sends entries of the loaded seed, drops entries of a *different*
+  loaded seed, and keeps entries while no slot is loaded. Seed-0 entries (no slot / pre-masterSeed
+  container) are memory-only and always flushed.
+- **Persistence.** Seed-scoped entries are mirrored to `Save/coop-outbox.json` (temp + rename), so a quit
+  or crash while offline loses nothing; read once per process on the first connection, entries older
+  than 48 h ignored, at most 4096 held. Disk writes happen on the network thread (`PersistOutboxIfDirty`,
+  once per reconnect attempt) and at `Disconnect()`, never on the game thread.
+- **Dead-link detection.** `combo/ComboNetKeepAlive.cpp` (new, own TU to keep Winsock away from
+  `<Windows.h>`) enables TCP keepalive (15 s idle, 3 s interval) plus `TCP_MAXRT`/`TCP_USER_TIMEOUT`
+  (30 s). SDL_net has no socket-option API, so the raw handle is read through SDL_net 2.x's
+  `struct _TCPsocket { int ready; SOCKET channel; ... }` layout and validated with
+  `getsockopt(SO_TYPE) == SOCK_STREAM` first; a layout mismatch only disables keepalive (logged).
+  `combo/CMakeLists.txt` links `ws2_32` explicitly on Windows.
+- `SDLNet_ResolveHost` is retried every 5 s instead of disabling Anchor; after a drop the loop waits 1 s
+  before reconnecting.
+- `UpdateRosterFromPacket` skips the full JSON parse unless the text can be a roster packet (it ran for
+  every packet both ways, including per-frame `PLAYER_UPDATE`s).
+- The roster snapshot gains `link { connected, enabled, outboxPending }`.
+
+**Toasts.** New thread-safe path: `Notification::EmitThreadSafe` (soh `Notification.{h,cpp}`, MM
+`BenGui/Notification.{h,cpp}`, `COMBO_BUILD`-guarded) queues under a mutex and `Window::Draw` drains the
+queue on the UI thread (`Emit` itself touches an unsynchronized vector and plays a sound, so it stays
+main-thread only). Exports `SOH_ComboToast` (`OTRGlobals.cpp`) / `MM_ComboToast` (`MMAnchor.cpp`) take
+`(prefix, message, suffix, gateCvar)`; the launcher calls the foreground game's. Shown:
+- own link: `Co-op connected` / `connection lost reconnecting...` (once per outage) / `reconnected` /
+  `sent N held updates` — gate `gRemote.Anchor.PartnerFeed.Connection`;
+- teammate presence (same team, not self): `<name> is online` / `went offline`, from the launcher's
+  roster (an `online` flip in `ALL_/UPDATE_CLIENT_STATE`, or joining/leaving the room). The first roster
+  of each connection only seeds; a state without an `online` field keeps the last known value —
+  gate `gRemote.Anchor.PartnerFeed.Presence`.
+
+**soh (`COMBO_BUILD`-guarded unless noted):**
+- `Anchor::ProgressHooksActive()` (new, `Anchor.h`/`Anchor.cpp`; non-combo body is plain `isConnected`):
+  `isConnected || isEnabled` in combo. `HookHandlers.cpp`: the ten save-progress hooks (`OnFlagSet`,
+  `OnFlagUnset`, `OnSceneFlagSet`, `OnSceneFlagUnset`, `OnRandoSetCheckStatus`, `OnRandoSetIsSkipped`,
+  `OnRandoEntranceDiscovered`, `OnBossDefeat` Ganon, `OnItemReceive`, `OnDungeonKeyUsed`) use it as their
+  `COND_HOOK` condition instead of `isConnected`, so they stay registered while reconnecting. (The hooks
+  are only re-evaluated on connect/disconnect, so finds before the *first* connection still aren't held.)
+- `Anchor::SendJsonToRemote` passes packets to the launcher while `isEnabled` too (the launcher decides
+  what to hold); nothing goes out once disabled.
+- `Anchor_BroadcastCrossItem` gates on `ProgressHooksActive()` and sets `addToQueue`.
+
+**MM (`MMAnchor.cpp`):** `SendPacket_GiveItem` and `SendPacket_CrossItem` set `addToQueue`. Replays are
+safe: MM `GIVE_ITEM` receive skips an already-`obtained` check; cross items dedup on `srcCheckName` and
+mark the source check obtained.
+
+**Save backups (`combo/ComboShip.cpp`, `BackupSaveContainersOnLaunch`):** first thing in `main`, before
+either game can write, every `Save/*.combosav` is copied to `Save/backups/<YYYY-MM-DD_HH-MM-SS>/`; the
+newest 10 sets are kept. Best-effort (errors logged, launch continues). Restore by hand with the game
+closed.
+
+**comboui (`combo/gui/ComboMenu.cpp`, `ComboAnchorRoomWindow.{h,cpp}`):** Network panel shows
+`N updates held for teammates` while the outbox is non-empty; two more Partner Feed toggles
+(online/offline, own connection status); **Save diagnostics bundle** button (always visible) copies
+`logs/*.log*`, the roster/link snapshot, `coop-outbox.json` and the non-secret connection settings into
+`diagnostics/<time>/` and opens it (Windows; `shell32` linked for `ShellExecuteW`).
+`ComboRando::AnchorRosterJson()` exposes the launcher roster snapshot to the menu.
+
+Not covered: finds made before the first successful connection of a session; MM flag sync (Phase 2c,
+unchanged); per-packet delivery acknowledgement (a packet the OS accepted just before a link died is
+still lost, as before; the next save's `UPDATE_TEAM_STATE` covers it).

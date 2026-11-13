@@ -25,8 +25,12 @@ Compared to the original ComboShip `develop` branch:
 - **Game-switch notice.** You get a message like `Teammate is now in Majora's Mask` whenever your teammate moves between the games.
 - **Toggles.** Both kinds of message can be turned off under Shared > Settings > Network > *Partner Feed*.
 - **Small fixes.** No echoed flag packets, a small memory leak fixed, and a teammate's single arrow no longer arrives as a "Fairy Bow".
+- **Nothing gets lost on a bad connection.** If your connection drops, items and progress you find are held and sent automatically once it is back, even if you quit the game in between. Item finds also wait on the server for a teammate who is offline at that moment. The Network panel shows how many updates are still waiting.
+- **Faster, steadier connection.** The network thread no longer keeps a CPU core busy, a dead connection is noticed within about half a minute and reconnects on its own, and you get a message when your connection drops or comes back and when a teammate goes online or offline (both can be turned off).
+- **Automatic save backups.** Every launch copies your save files to `Save/backups/` first (the last 10 launches are kept).
+- **Diagnostics button.** *Save diagnostics bundle* in the Network panel collects the logs into one folder you can attach to a bug report.
 
-All of it lives in the Anchor networking code and is documented in [`docs/deviations/anchor.md`](docs/deviations/anchor.md). The sections dated 2026-11-07 are the ones added by this fork.
+All of it lives in the Anchor networking code and is documented in [`docs/deviations/anchor.md`](docs/deviations/anchor.md). The sections dated 2026-11-07 and 2026-11-13 are the ones added by this fork.
 
 **Both players need a build of this fork.** An official ComboShip build still connects, but you only get the parts both sides support.
 
