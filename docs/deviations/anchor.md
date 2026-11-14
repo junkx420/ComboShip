@@ -346,3 +346,177 @@ on `HasLoadedRandoSave` ("don't ask for a state we can't consume"). Left unchang
 sequence and this fix's own playtest table depend on the dormant boot-time resync *request* still going
 out while no slot is loaded yet (that's what proves the refusal path works); it's the *reply* that's now
 correctly refused by `HandlePacket_UpdateTeamState`'s `HasLoadedRandoSave` guard.
+
+## OOT co-op sync audit: flag echo, effect leak, single-arrow-as-Bow (2026-11-07)
+
+**Why:** audit of the same-game shared-progression sync (OOT↔OOT over Anchor). Item sync
+(`OnItemReceive` → `GIVE_ITEM`, which every `Item_Give`/`Randomizer_Item_Give` reaches via
+`Return_Item_Entry`, including `EnItem00` rupee/ammo/heart drops), world-flag sync (`OnSceneFlagSet`/
+`OnFlagSet` → `SET_FLAG`/`UNSET_FLAG`) and same-room chest state (`EnBox_WaitOpen` already switches to
+`EnBox_Open` once the treasure flag is set) all exist upstream. Three defects remained.
+
+Fixes, all `COMBO_BUILD`, no wire change:
+- `soh/soh/Network/Anchor/Packets/SetFlag.cpp` / `UnsetFlag.cpp` (`SendPacket_*`): skip while
+  `isProcessingIncomingPacket`, like `GIVE_ITEM`/`ENTRANCE_DISCOVERED` already did. A flag set as a side
+  effect of applying a remote packet (e.g. `Randomizer_Item_Give` inside `HandlePacket_GiveItem`) was
+  echoed back to the whole team — one redundant hop per receiver, O(N²) packets per flag. Terminating
+  before (the `RawAction` apply path writes flags directly and fires no hook) but wasteful.
+- Same files (`HandlePacket_*`): `delete` the `GameInteractionEffect` after its synchronous `Apply()`;
+  upstream `new`-ed one per received flag packet and never freed it.
+- `soh/soh/Network/Anchor/Packets/GiveItem.cpp` (`HandlePacket_GiveItem`): `EnItem00`'s single-arrow drop
+  grants `Item_Give(ITEM_BOW)`, which `Return_Item` maps to `GI_BOW`, so one arrow arrived at teammates
+  as a vanilla Bow — a `ITEM_CATEGORY_MAJOR` "found Fairy Bow" toast per arrow, and a bow-less receiver
+  would have been granted Bow + quiver outside the seed. ComboShip is always rando (real Bow is
+  `RG_FAIRY_BOW`, `MOD_RANDOMIZER`), so a `MOD_NONE` `GI_BOW` is treated as +1 arrow when a quiver is
+  owned, dropped otherwise, never toasted.
+
+Known remaining gaps (not changed): `ITEM00_FLEXIBLE` heals via `Health_ChangeBy` and is not shared;
+direct `Rupees_ChangeBy` rewards outside `Item_Give` are not shared; while OOT is dormant,
+`PumpDormant` drops `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS` and relies on the next
+`UPDATE_TEAM_STATE` resync; MM still has no flag sync (Phase 2c).
+
+## Split-game co-op: background world sync + live partner feed (2026-11-07)
+
+**Why:** the common combo co-op shape is one player mostly in OOT and the other mostly in MM, switching
+when a game runs dry. Two gaps made that feel disconnected: (1) a client whose OOT was dormant dropped
+the teammate's `SET_FLAG`/`UNSET_FLAG`/`SET_CHECK_STATUS`/`UPDATE_DUNGEON_ITEMS`/`UPDATE_BEANS_COUNT`/
+`ENTRANCE_DISCOVERED` — only the item arrived, the world state waited for the teammate's next save
+(`UPDATE_TEAM_STATE`), so switching to OOT before that showed closed chests and allowed a double grant;
+(2) every "teammate found X" toast was suppressed for the game you are *not* in, and MM's same-game
+`GIVE_ITEM` receive never toasted at all.
+
+**Background world sync** (all `COMBO_BUILD`, no wire change):
+- `soh/soh/Network/Anchor/Anchor.cpp` (`PumpDormant`): applies those six packet types to the resident
+  save under `isDormantApply` + `isProcessingIncomingPacket` (so hooks they fire can't re-broadcast) and
+  persists via the existing `dormantDidApply` save.
+- `Packets/SetFlag.cpp` / `UnsetFlag.cpp`: a dormant branch. `GameInteractionEffect::*` refuses without
+  `gPlayState` and `RawAction::SetSceneFlag` dereferences `gPlayState->sceneNum`, so scene flags go
+  through the new `Anchor_DormantWriteSceneFlag` (save half of `RawAction::SetSceneFlag`: switch flags
+  `>= 0x20` and collectible flag 0 are temp/unsaved and skipped) and global flags through
+  `RawAction::SetFlag`/`UnsetFlag` (save-only already). The item swaps (Ruto's Letter, adult trade) use
+  `Anchor_DormantReplaceItem` = `Inventory_ReplaceItem` minus its `Interface_LoadItemIcon1(play, ...)`.
+  Both helpers are declared in `Anchor.h`. Valid because while OOT is dormant the save copy of the scene
+  flags is authoritative (`UpdateTeamState.cpp` already relies on this).
+- `Packets/SetCheckStatus.cpp`: while dormant only the status is stored; the tracker recalcs (logic
+  evaluation) are skipped and rerun on the next foreground change / file load.
+
+**Live partner feed** — new display-only packet `COMBO_PARTNER_FIND` {`itemName`, `itemGame`
+(`"oot"`/`"mm"`, the item's home game), `kind` (`"item"`/`"cross"`)}, never `addToQueue`d:
+- Sent by OOT from `SendPacket_GiveItem` (rando, non-junk, non-ice-trap) and `Anchor_BroadcastCrossItem`;
+  by MM from `MMAnchor::SendPacket_GiveItem` (non-`RITYPE_JUNK`, raw item name) and
+  `MMAnchor_BroadcastCrossItem`.
+- Both origin filters (`Anchor::OnIncomingJson`, `MMAnchor::OnIncomingJson`) let it through. Handled only
+  by the foreground game; both `PumpDormant`s drop it.
+- Shown only where no existing toast covers it. OOT: `kind=item` from MM origin, or `kind=cross` with
+  `itemGame=mm`. MM: every `kind=item` (MM's own receive is silent), or `kind=cross` with `itemGame=oot`.
+  Suffix `(MM)`/`(OoT)` marks the other game. Own `clientId` and other teams are ignored.
+
+Not covered: foreign traps are announced under their raw cross name; the dormant OOT check-tracker
+area totals refresh only once OOT is foreground again.
+
+## Partner feed: game-switch toast + feed toggles (2026-11-07)
+
+**Why:** in split play you lose track of which game your teammate is in, and the feed should be easy to
+silence.
+
+- **Game-switch toast** ("<name> is now in Majora's Mask / Ocarina of Time"), receiver-only, no wire
+  change. A peer's two games share one Anchor clientId and MM namespaces its client-state `sceneNum`
+  (`>= 1000`), so a flip across 1000 between two loaded states is a game switch.
+  - OOT: `Packets/UpdateClientState.cpp` (`HandlePacket_UpdateClientState`, compares against the stored
+    client before overwriting).
+  - MM: `MMAnchor.{h,cpp}`, new `MMAnchorClient::lastGame`, seeded in `HandlePacket_AllClientState`.
+  - Connecting never toasts (ALL_CLIENT_STATE only seeds). Self, other teams and unloaded states are
+    ignored. Only the foreground game toasts; a switch that happened while your current game was dormant
+    is announced late, on that teammate's next state.
+- **Toggles** in the combo Shared > Settings > Network panel (`combo/gui/ComboMenu.cpp`), both default on,
+  local display only: `gRemote.Anchor.PartnerFeed.Finds` (COMBO_PARTNER_FIND toasts) and
+  `gRemote.Anchor.PartnerFeed.GameSwitch`.
+
+
+## Co-op hardening: connection, held updates, backups, toasts (2026-11-13)
+
+**Why:** a pre-session review of the launcher-owned connection found that nothing protected progress
+across a network hiccup, and that the receive loop itself was expensive:
+
+- `ReceiveLoop` polled `SDLNet_CheckSockets(set, 0)` and `continue`d on "no data", spinning one CPU core
+  at 100% for the whole session.
+- `SDLNet_TCP_Send`'s result was ignored: a failed send silently lost the packet (possibly an item).
+- A dead link (Wi-Fi drop, router reset) was never noticed without outbound traffic; a failed DNS lookup
+  at boot disabled Anchor for the whole session.
+- While disconnected, OOT dropped every packet in `SendJsonToRemote` and unregistered its progress hooks,
+  so finds made then never reached the teammate (until a later save); MM kept handing its per-frame
+  `PLAYER_UPDATE`s to the launcher, where they piled up unbounded and were replayed as a stale burst.
+- MM `GIVE_ITEM` and both games' `COMBO_CROSS_ITEM` had no `addToQueue`, so a teammate who was offline at
+  that moment never received them (soh's `GIVE_ITEM`/flags/check status already had it).
+
+**Launcher (`combo/ComboShip.cpp`, `ComboAnchor`; combo-owned):**
+- Receive loop waits `kPollMs` (5 ms) for inbound data instead of spinning; recv buffer 512 -> 4096.
+- **Offline outbox.** `Send()` while disconnected keeps save-affecting packets (`IsDurablePacketType`:
+  `GIVE_ITEM`, `COMBO_CROSS_ITEM`, `SET_FLAG`, `UNSET_FLAG`, `SET_CHECK_STATUS`, `UPDATE_DUNGEON_ITEMS`,
+  `UPDATE_BEANS_COUNT`, `ENTRANCE_DISCOVERED`, `GAME_COMPLETE`) and drops live-only ones. A short send
+  ends the connection and holds the failed packet plus everything queued behind it. Packets left in the
+  send queue when a connection ends are held the same way. On the next connection the outbox is flushed
+  right behind the `HANDSHAKE`. `UPDATE_TEAM_STATE` is deliberately not held (full snapshot, re-sent on
+  the next save).
+- **Seed scope.** Each held packet records `g_loadedMasterSeed` (the loaded slot's `combo.rando.masterSeed`,
+  set in `LoadComboCompletion`). Flush sends entries of the loaded seed, drops entries of a *different*
+  loaded seed, and keeps entries while no slot is loaded. Seed-0 entries (no slot / pre-masterSeed
+  container) are memory-only and always flushed.
+- **Persistence.** Seed-scoped entries are mirrored to `Save/coop-outbox.json` (temp + rename), so a quit
+  or crash while offline loses nothing; read once per process on the first connection, entries older
+  than 48 h ignored, at most 4096 held. Disk writes happen on the network thread (`PersistOutboxIfDirty`,
+  once per reconnect attempt) and at `Disconnect()`, never on the game thread.
+- **Dead-link detection.** `combo/ComboNetKeepAlive.cpp` (new, own TU to keep Winsock away from
+  `<Windows.h>`) enables TCP keepalive (15 s idle, 3 s interval) plus `TCP_MAXRT`/`TCP_USER_TIMEOUT`
+  (30 s). SDL_net has no socket-option API, so the raw handle is read through SDL_net 2.x's
+  `struct _TCPsocket { int ready; SOCKET channel; ... }` layout and validated with
+  `getsockopt(SO_TYPE) == SOCK_STREAM` first; a layout mismatch only disables keepalive (logged).
+  `combo/CMakeLists.txt` links `ws2_32` explicitly on Windows.
+- `SDLNet_ResolveHost` is retried every 5 s instead of disabling Anchor; after a drop the loop waits 1 s
+  before reconnecting.
+- `UpdateRosterFromPacket` skips the full JSON parse unless the text can be a roster packet (it ran for
+  every packet both ways, including per-frame `PLAYER_UPDATE`s).
+- The roster snapshot gains `link { connected, enabled, outboxPending }`.
+
+**Toasts.** New thread-safe path: `Notification::EmitThreadSafe` (soh `Notification.{h,cpp}`, MM
+`BenGui/Notification.{h,cpp}`, `COMBO_BUILD`-guarded) queues under a mutex and `Window::Draw` drains the
+queue on the UI thread (`Emit` itself touches an unsynchronized vector and plays a sound, so it stays
+main-thread only). Exports `SOH_ComboToast` (`OTRGlobals.cpp`) / `MM_ComboToast` (`MMAnchor.cpp`) take
+`(prefix, message, suffix, gateCvar)`; the launcher calls the foreground game's. Shown:
+- own link: `Co-op connected` / `connection lost reconnecting...` (once per outage) / `reconnected` /
+  `sent N held updates` — gate `gRemote.Anchor.PartnerFeed.Connection`;
+- teammate presence (same team, not self): `<name> is online` / `went offline`, from the launcher's
+  roster (an `online` flip in `ALL_/UPDATE_CLIENT_STATE`, or joining/leaving the room). The first roster
+  of each connection only seeds; a state without an `online` field keeps the last known value —
+  gate `gRemote.Anchor.PartnerFeed.Presence`.
+
+**soh (`COMBO_BUILD`-guarded unless noted):**
+- `Anchor::ProgressHooksActive()` (new, `Anchor.h`/`Anchor.cpp`; non-combo body is plain `isConnected`):
+  `isConnected || isEnabled` in combo. `HookHandlers.cpp`: the ten save-progress hooks (`OnFlagSet`,
+  `OnFlagUnset`, `OnSceneFlagSet`, `OnSceneFlagUnset`, `OnRandoSetCheckStatus`, `OnRandoSetIsSkipped`,
+  `OnRandoEntranceDiscovered`, `OnBossDefeat` Ganon, `OnItemReceive`, `OnDungeonKeyUsed`) use it as their
+  `COND_HOOK` condition instead of `isConnected`, so they stay registered while reconnecting. (The hooks
+  are only re-evaluated on connect/disconnect, so finds before the *first* connection still aren't held.)
+- `Anchor::SendJsonToRemote` passes packets to the launcher while `isEnabled` too (the launcher decides
+  what to hold); nothing goes out once disabled.
+- `Anchor_BroadcastCrossItem` gates on `ProgressHooksActive()` and sets `addToQueue`.
+
+**MM (`MMAnchor.cpp`):** `SendPacket_GiveItem` and `SendPacket_CrossItem` set `addToQueue`. Replays are
+safe: MM `GIVE_ITEM` receive skips an already-`obtained` check; cross items dedup on `srcCheckName` and
+mark the source check obtained.
+
+**Save backups (`combo/ComboShip.cpp`, `BackupSaveContainersOnLaunch`):** first thing in `main`, before
+either game can write, every `Save/*.combosav` is copied to `Save/backups/<YYYY-MM-DD_HH-MM-SS>/`; the
+newest 10 sets are kept. Best-effort (errors logged, launch continues). Restore by hand with the game
+closed.
+
+**comboui (`combo/gui/ComboMenu.cpp`, `ComboAnchorRoomWindow.{h,cpp}`):** Network panel shows
+`N updates held for teammates` while the outbox is non-empty; two more Partner Feed toggles
+(online/offline, own connection status); **Save diagnostics bundle** button (always visible) copies
+`logs/*.log*`, the roster/link snapshot, `coop-outbox.json` and the non-secret connection settings into
+`diagnostics/<time>/` and opens it (Windows; `shell32` linked for `ShellExecuteW`).
+`ComboRando::AnchorRosterJson()` exposes the launcher roster snapshot to the menu.
+
+Not covered: finds made before the first successful connection of a session; MM flag sync (Phase 2c,
+unchanged); per-packet delivery acknowledgement (a packet the OS accepted just before a link died is
+still lost, as before; the next save's `UPDATE_TEAM_STATE` covers it).

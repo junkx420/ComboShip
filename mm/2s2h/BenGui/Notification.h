@@ -32,6 +32,12 @@ class Window : public Ship::GuiWindow {
 
 void Emit(Options notification);
 
+#ifdef COMBO_BUILD
+// ComboShip (2026-11-13): Emit from any thread (e.g. the launcher's Anchor receive thread). Queued and
+// shown on the next UI frame; Emit itself is main-thread only (unsynchronized vector + audio).
+void EmitThreadSafe(Options notification);
+#endif
+
 } // namespace Notification
 
 #endif // __cplusplus

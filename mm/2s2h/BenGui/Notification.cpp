@@ -10,12 +10,41 @@ extern "C" {
 
 #include <fast/Fast3dGui.h>
 
+#ifdef COMBO_BUILD
+#include <mutex> // ComboShip: EmitThreadSafe
+#endif
+
 namespace Notification {
 
 static uint32_t nextId = 0;
 static std::vector<Options> notifications = {};
 
+#ifdef COMBO_BUILD
+// ComboShip (2026-11-13): toasts handed in from other threads, moved into `notifications` on the UI thread.
+static std::mutex sPendingMutex;
+static std::vector<Options> sPending;
+
+void EmitThreadSafe(Options notification) {
+    std::lock_guard<std::mutex> lock(sPendingMutex);
+    sPending.push_back(std::move(notification));
+}
+
+static void DrainPending() {
+    std::vector<Options> pending;
+    {
+        std::lock_guard<std::mutex> lock(sPendingMutex);
+        pending.swap(sPending);
+    }
+    for (auto& notification : pending) {
+        Emit(std::move(notification));
+    }
+}
+#endif
+
 void Window::Draw() {
+#ifdef COMBO_BUILD
+    DrainPending(); // before the "Hidden" early-out, so queued toasts still expire normally
+#endif
     auto vp = ImGui::GetMainViewport();
 
     const float margin = 30.0f;

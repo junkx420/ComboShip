@@ -1,166 +1,57 @@
-# ComboShip
+# ComboShip — Co-op Fan Fork (junkx420)
 
-**ComboShip is a cross-game randomizer for [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) (Ocarina of Time) and [2 Ship 2 Harkinian](https://github.com/2ship2harkinian/2ship2harkinian) (Majora's Mask).**
+> [!IMPORTANT]
+> **This is NOT the official ComboShip. It is a personal fan project, a fork made for fun.**
+>
+> - **All credit for ComboShip goes to its creator, [Varuuna](https://github.com/Varuuna), and everyone who contributes to the original project: [github.com/Varuuna/ComboShip](https://github.com/Varuuna/ComboShip).** This fork only adds a few co-op changes on top of their work.
+> - This fork is **not affiliated with, endorsed by, or supported by** the ComboShip developers, the HarbourMasters team (Ship of Harkinian), or the 2 Ship 2 Harkinian team.
+> - **Please do not report problems from this fork to the original projects.** If something breaks here, it is most likely my fault. Open an issue in *this* repository instead.
+> - The goal is to offer these changes to the original project. Once they are merged there (or turned down), please use the official ComboShip, not this fork.
+> - Parts of this fork were written with AI assistance.
 
-**DISCLAIMER: THIS IS AN UNOFFICIAL PROJECT AND USES AI AS PART OF THE DEVELOPMENT. IT IS NOT CREATED OR HANDLED BY THE HARBOUR MASTERS TEAM. BRING ANY IDEAS, QUESTIONS, OR CONCERNS TO ME DIRECTLY!**
+## Why this fork exists
 
-## What it is
+My friend and I play ComboShip co-op over Anchor, usually split across the two games: one of us mostly in Ocarina of Time, the other mostly in Majora's Mask, and we switch when one game runs out of checks. In that setup a couple of things felt disconnected, so this fork tries to make split play feel like one shared run.
 
-Like [OOTMM](https://ootmm.com/), ComboShip shuffles items across *both* games at once: a check in Ocarina of Time can hold a Majora's Mask item and vice-versa, and a single seed spans the two. Both games run together in one application; ComboShip builds that combined runtime on top of the existing Ship of Harkinian and 2 Ship 2 Harkinian ports.
+## What this fork changes
 
-## Features
+Compared to the original ComboShip `develop` branch:
 
-- Anything within Ship and 2Ship is here. When those projects gets new updates, they are not far from inclusion here.
-- Online Multiplayer through Anchor. And yes it works cross-game as well. Work together in OOT and MM, split or together.
+- **Background world sync.** While you play MM, your teammate's OoT progress still lands in your OoT save right away: opened chests, world flags, check-tracker status, discovered entrances, dungeon keys and magic beans. When you switch to OoT, their chests are already open, so the same check can't be collected twice. (Before, this only caught up after the teammate saved.)
+- **Live partner feed.** You see what your teammate finds in the *other* game, e.g. `Teammate found Hookshot (MM)` while you are in OoT. Junk such as rupees and ammo is left out. It only shows a message and never gives items.
+- **Game-switch notice.** You get a message like `Teammate is now in Majora's Mask` whenever your teammate moves between the games.
+- **Toggles.** Both kinds of message can be turned off under Shared > Settings > Network > *Partner Feed*.
+- **Small fixes.** No echoed flag packets, a small memory leak fixed, and a teammate's single arrow no longer arrives as a "Fairy Bow".
+- **Nothing gets lost on a bad connection.** If your connection drops, items and progress you find are held and sent automatically once it is back, even if you quit the game in between. Item finds also wait on the server for a teammate who is offline at that moment. The Network panel shows how many updates are still waiting.
+- **Faster, steadier connection.** The network thread no longer keeps a CPU core busy, a dead connection is noticed within about half a minute and reconnects on its own, and you get a message when your connection drops or comes back and when a teammate goes online or offline (both can be turned off).
+- **Automatic save backups.** Every launch copies your save files to `Save/backups/` first (the last 10 launches are kept).
+- **Diagnostics button.** *Save diagnostics bundle* in the Network panel collects the logs into one folder you can attach to a bug report.
 
-## Future plans
+All of it lives in the Anchor networking code and is documented in [`docs/deviations/anchor.md`](docs/deviations/anchor.md). The sections dated 2026-11-07 and 2026-11-13 are the ones added by this fork.
 
-- Possibly looking into some more OOTMM features, but it's not a priority yet.
-- Possible Archipelago support as well, ideally through the existing SoH implementation
+**Both players need a build of this fork.** An official ComboShip build still connects, but you only get the parts both sides support.
 
-## Got issues?
+## Downloads (Windows / Linux / macOS)
 
-Check out the nightly builds to see if your issue has already been fixed for an upcoming release:
-- [Windows](https://nightly.link/Varuuna/ComboShip/workflows/build-artifacts/develop/ComboShip-windows.zip)
-- [Linux](https://nightly.link/Varuuna/ComboShip/workflows/build-artifacts/develop/ComboShip-linux.zip) / [Linux AppImage](https://nightly.link/Varuuna/ComboShip/workflows/build-artifacts/develop/ComboShip-linux-appimage.zip)
-- [macOS](https://nightly.link/Varuuna/ComboShip/workflows/build-artifacts/develop/ComboShip-macos.zip)
+Builds are made by GitHub Actions:
 
-If you can still reproduce it, please create an issue.
+- **Releases:** see the [Releases page](../../releases), if a release exists.
+- **Latest CI build:** open the newest successful run under [Actions](../../actions), scroll to **Artifacts** and download the archive for your system (`ComboShip-windows`, `ComboShip-linux` / `ComboShip-linux-appimage`, `ComboShip-macos`).
 
-## Building
+Like the original, ComboShip needs your own legally dumped Ocarina of Time and Majora's Mask ROMs. No game data is included or shared here.
 
-ComboShip builds on **Windows** (below), **macOS** (below) and **Linux** — see
-[`docs/BUILDING_LINUX.md`](docs/BUILDING_LINUX.md) for Linux build, run and
-AppImage packaging instructions.
+## Building it yourself
 
-### Windows
+The build works the same as the original project. See [`docs/BUILDING_LINUX.md`](docs/BUILDING_LINUX.md) for Linux, and the [original ComboShip README](https://github.com/Varuuna/ComboShip#readme) for Windows and macOS.
 
-**Prerequisites** — Windows 10/11 (x64), Visual Studio 2022 (MSVC, with C++20 / C23 support), CMake 3.26 or newer.
+## Credits
 
-From the repository root (the clone folder, which contains this README), configure once to generate the Visual Studio solution:
-
-```powershell
-cmake -B build/x64 -A x64
-```
-
-Helper scripts in `scripts/` wrap `cmake --build` and default to a Debug build (pass `--Release` for Release):
-
-```powershell
-./scripts/build-comboship.ps1  ->  ComboShip.exe
-```
-
-### macOS
-
-**Prerequisites** — macOS 11 or newer (Apple Silicon or Intel), Xcode command line tools, and the
-Homebrew dependencies below. Ninja is used, matching what both upstream ports document.
-
-```bash
-brew install cmake ninja libpng glew tinyxml2 nlohmann-json libzip opusfile libvorbis libogg opus spdlog glfw sdl2_net
-```
-
-```bash
-cmake -S . -B build-macos -GNinja -DCMAKE_BUILD_TYPE=Release
-```
-
-```bash
-cmake --build build-macos --target ComboShip -j10
-```
-
-That produces the full runtime in `build-macos/combo/` — the launcher, plus `libsoh.dylib`,
-`lib2ship.dylib` and `libultraship.dylib` symlinked beside it, exactly as the Linux build stages
-them. Run `./build-macos/combo/ComboShip` **from that directory**: the launcher itself finds its
-modules by executable path, but the asset archives are still resolved relative to the working
-directory (or `SHIP_HOME`).
-
-#### A note on audio
-
-libultraship defaults macOS to the CoreAudio backend, whose player binds the output device directly
-and requests a hardcoded 44100 Hz. macOS persists a device's format, so that can leave your output
-device reconfigured **system-wide, permanently** — a DisplayPort display pinned at 44100 instead of
-48000 will cut out in every application, and it survives a reboot.
-
-ComboShip therefore uses the SDL backend on macOS, and rewrites a saved `coreaudio` setting to
-`sdl` — otherwise anyone who had already launched an earlier build would stay exposed, since
-`coreaudio` is what the old default wrote for them. In practice this means **CoreAudio cannot be
-selected on macOS**: picking it in Audio settings holds for the session and reverts on the next
-launch. If you really want it, run with `SHIP_AUDIO_BACKEND=coreaudio` each time.
-
-If your audio is already in that state, fix it in **Audio MIDI Setup** — select the device, set
-Format back to **48000 Hz**.
-
-#### A note on SDL2
-
-Homebrew's `sdl2` is now an alias for **sdl2-compat** — the SDL2 API reimplemented on top of SDL3.
-Real SDL2 is no longer in homebrew-core. ComboShip builds and runs fine against it, so the command
-above is the quick path for a development build. It cannot be packaged, though: sdl2-compat loads
-SDL3 at run time, which the `.app` cannot carry, so `cpack` refuses it.
-
-It is not what upstream uses, though, and it is measurably worse here. A Time Profiler capture while
-dragging tracker windows showed a noticeable share of main-thread time in ObjC/CoreFoundation churn
-and Apple's GameController framework, which is how SDL3 drives macOS gamepads. Rebuilding against
-genuine SDL2 reduced (but did not eliminate) the stutter.
-
-For genuine SDL2, either use MacPorts `libsdl2` — what HarbourMasters' own macOS CI uses — or build
-SDL2 and SDL2_net from source into a prefix and point CMake at it. Build **both**: Homebrew's
-`sdl2_net` links against sdl2-compat, and two SDL2s in one process is worse than either alone.
-HarbourMasters' Linux CI pins **2.30.3**:
-
-```bash
-cmake -S . -B build-macos -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$SDL2_PREFIX" -DSDL2_DIR="$SDL2_PREFIX/lib/cmake/SDL2" -DSDL2_net_DIR="$SDL2_PREFIX/lib/cmake/SDL2_net"
-```
-
-Setting `SDL2_DIR`/`SDL2_net_DIR` explicitly matters: CMake will not re-search once those cache
-entries exist, so `CMAKE_PREFIX_PATH` alone silently keeps whatever was found first. Verify with
-`otool -L build-macos/combo/ComboShip` — genuine 2.30.3 reports `current version 3001.3.0`,
-sdl2-compat reports `3201.x`.
-
-A source-built SDL installs itself as `@rpath/libSDL2-2.0.0.dylib`, which only resolves if the
-dylib sits beside the binaries, so the build copies it into the runtime directory and into the
-`.app` automatically. Homebrew's SDL has an absolute install name and needs no such copy; the build
-picks between the two by reading the install name, so neither route needs a flag.
-
-## Packaging
-
-### Windows
-
-`cpack` produces a single ZIP bundling the full runtime (`ComboShip.exe`, the engine and UI DLLs, both ports, and assets):
-
-```powershell
-cpack
-```
-
-### macOS
-
-`cpack` produces an ad-hoc signed `ComboShip.app` inside a DMG. It needs genuine SDL2 (see the SDL2
-note above) and the port archives. Generate those first — the install rules copy them from the
-source tree (`soh/soh.o2r`, `mm/2ship.o2r`) and fail the package if either is missing:
-
-```bash
-cmake --build build-macos --target GenerateSohOtr && cmake --build build-macos --target Generate2ShipOtr
-```
-
-```bash
-cd build-macos && cpack
-```
-
-The `.app` is self-contained: packaging copies every non-system dylib it uses into
-`Contents/MacOS`, so it runs on a Mac without Homebrew. Those dylibs are built for the macOS they
-were installed on, not for the 11.0 deployment target, so the bundle's `LSMinimumSystemVersion` is
-set to the newest `minos` among them — a bundle built on macOS 14 requires macOS 14.
-
-The bundle keeps its own settings and saves in `~/Library/Application Support/com.comboship.ComboShip`,
-so it never touches a Ship of Harkinian or 2 Ship 2 Harkinian install. ROM-derived archives are
-player-extracted into that folder and are deliberately never packaged.
-
-## Contributing
-
-ComboShip is built on two upstream projects, kept as vendored copies under `soh/` and `mm/`:
-
-- Ship of Harkinian — https://github.com/HarbourMasters/Shipwright
-- 2 Ship 2 Harkinian — https://github.com/2ship2harkinian/2ship2harkinian
-
-ComboShip-specific code lives in `combo/`, and changes to the vendored ports are kept minimal and guarded behind `COMBO_BUILD`. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and [`docs/UPSTREAM_MERGES.md`](docs/UPSTREAM_MERGES.md) for how upstream changes are merged in.
+- **ComboShip** by [Varuuna](https://github.com/Varuuna) and contributors: [github.com/Varuuna/ComboShip](https://github.com/Varuuna/ComboShip). Everything here is their work, except the few changes listed above.
+- **Ship of Harkinian** by the [HarbourMasters](https://github.com/HarbourMasters/Shipwright) team, including the Anchor co-op mode this fork builds on.
+- **2 Ship 2 Harkinian** by the [2 Ship 2 Harkinian](https://github.com/2ship2harkinian/2ship2harkinian) team.
+- **libultraship** by [Kenix3](https://github.com/Kenix3/libultraship) and contributors.
+- Inspired by [OoTMM](https://ootmm.com/).
 
 ## License
 
-ComboShip combines two separately-licensed projects; each retains its own license. See the `soh/` and `mm/` directories for details.
+Nothing is relicensed here. Each bundled project keeps its own license: see the upstream repositories linked above and [`libultraship/LICENSE`](libultraship/LICENSE). This fork's changes are offered under the same terms as the files they modify.

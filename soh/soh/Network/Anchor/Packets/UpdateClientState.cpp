@@ -3,6 +3,9 @@
 #include <nlohmann/json.hpp>
 #include "soh/OTRGlobals.h"
 #include "soh/Enhancements/randomizer/SeedContext.h"
+#ifdef COMBO_BUILD
+#include "soh/Notification/Notification.h" // ComboShip: game-switch toast
+#endif
 
 extern "C" {
 #include "variables.h"
@@ -60,6 +63,26 @@ void Anchor::HandlePacket_UpdateClientState(nlohmann::json payload) {
 
     if (clients.contains(clientId)) {
         AnchorClient client = payload["state"].get<AnchorClient>();
+#ifdef COMBO_BUILD
+        // ComboShip: game-switch toast (2026-11-07). A peer's two games share one clientId; MM reports a
+        // namespaced sceneNum (>= 1000, MMAnchor's MM_ANCHOR_SCENE_NAMESPACE), so a flip across 1000
+        // between two loaded states means the teammate crossed between the games. The first state we see
+        // (ALL_CLIENT_STATE) only seeds the value, so connecting never toasts.
+        {
+            const AnchorClient& prev = clients[clientId];
+            bool wasMM = prev.sceneNum >= 1000;
+            bool isMM = client.sceneNum >= 1000;
+            if (!prev.self && clientId != ownClientId && prev.isSaveLoaded && client.isSaveLoaded && wasMM != isMM &&
+                client.teamId == CVarGetString(CVAR_REMOTE_ANCHOR("TeamId"), "default") &&
+                CVarGetInteger(CVAR_REMOTE_ANCHOR("PartnerFeed.GameSwitch"), 1)) {
+                Notification::Emit({
+                    .prefix = client.name,
+                    .message = "is now in",
+                    .suffix = isMM ? "Majora's Mask" : "Ocarina of Time",
+                });
+            }
+        }
+#endif
         clients[clientId].clientId = clientId;
         clients[clientId].name = client.name;
         clients[clientId].color = client.color;

@@ -27,6 +27,9 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <ctime>
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 // SDL_net.h pulls in SDL.h -> SDL_main.h, which #defines main -> SDL_main unless we opt out.
@@ -849,6 +852,15 @@ static FnSetPumpDormant MM_SetPumpDormant = nullptr;
 static FnVoidArgless SOH_Anchor_PumpDormant = nullptr;
 static FnVoidArgless MM_Anchor_PumpDormant = nullptr;
 
+// Co-op hardening (2026-11-13): thread-safe toast into a game's notification window (prefix, message,
+// suffix, gate CVar or null = always). The game queues it and shows it on its next UI frame, so this is
+// safe to call from the Anchor receive thread. Only the foreground game's window is drawn.
+typedef void (*FnComboToast)(const char*, const char*, const char*, const char*);
+static FnComboToast SOH_ComboToast = nullptr;
+static FnComboToast MM_ComboToast = nullptr;
+// Co-op hardening (2026-11-13): TCP keepalive on the Anchor socket (combo/ComboNetKeepAlive.cpp).
+bool ComboNet_EnableKeepAlive(void* sdlTcpSocket);
+
 // Cross-game item delivery seam (issue #3). Each game's foreign-check detection (and the Anchor
 // receive path) routes an item to the OTHER game through one launcher-owned dispatcher, which calls
 // the target DLL's save-only grant export. The same dispatcher serves the single-player and
@@ -875,6 +887,10 @@ static FnSetBossDefeatedCb SOH_SetFinalBossDefeatedCb = nullptr;
 static FnSetBossDefeatedCb MM_SetFinalBossDefeatedCb = nullptr;
 static bool g_comboCompletion[2] = { false, false };
 static int g_comboCompletionSlot = -1;
+// Co-op hardening (2026-11-13): masterSeed of the loaded slot (0 = none / pre-masterSeed container).
+// Scopes the Anchor offline outbox, so a held packet is never replayed into a different playthrough.
+// Written on the game thread (LoadComboCompletion), read on the Anchor thread.
+static std::atomic<uint32_t> g_loadedMasterSeed{ 0 };
 
 // ComboShip (#136): Triforce Hunt is ONE combined goal — the launcher pushes it into both DLLs, sums
 // both counters on every piece grant/merge, and dispatches the ending itself.
@@ -959,6 +975,160 @@ static std::atomic<int> sActiveGame{ 0 };
 // gPlayState/isDormantApply, which PumpDormant also mutates there). Set here, drained by PumpDormant.
 static std::atomic<bool> sResyncPending{ false };
 
+// ---- Co-op hardening (2026-11-13): offline outbox, link-state toasts, presence toasts ----
+// Save-affecting packets that could not go out (disconnected, or a send failed mid-stream) are held
+// here instead of being dropped, and flushed after the next handshake. Guarded by sOutMutex.
+// Live-only packets (pose, sfx, presence) are dropped while disconnected — replaying them is useless.
+struct OutboxEntry {
+    uint32_t seed = 0;  // g_loadedMasterSeed when held; 0 = unknown (memory only, never persisted)
+    int64_t heldAt = 0; // unix seconds
+    std::string packet; // the exact JSON the game handed to Send()
+};
+static std::deque<OutboxEntry> sOutbox;
+static std::atomic<int> sOutboxCount{ 0 };        // for the network panel, no lock needed
+static std::atomic<bool> sEverConnected{ false }; // since Connect(): tells a reconnect from the first connect
+static bool sOutboxDiskLoaded = false;            // disk outbox read once per process (guarded by sOutMutex)
+static bool sOutboxDirty = false;                 // memory outbox newer than the disk copy (guarded by sOutMutex)
+static bool sPresenceSeeded = false;              // guarded by sRosterMutex; first roster after connect only seeds
+constexpr int64_t kOutboxMaxAgeSeconds = 48 * 60 * 60;
+constexpr size_t kOutboxMaxEntries = 4096; // a runaway flag loop must not grow this without bound
+
+static void Toast(const char* prefix, const char* message, const char* suffix, const char* gateCvar) {
+    FnComboToast fn = sActiveGame.load() == 1 ? MM_ComboToast : SOH_ComboToast;
+    if (fn)
+        fn(prefix ? prefix : "", message ? message : "", suffix ? suffix : "", gateCvar);
+}
+
+// Packets worth holding across a disconnect: everything that changes a teammate's save. Their receive
+// paths are already idempotent or progressive (see docs/deviations/anchor.md), and none of them is
+// time-sensitive. UPDATE_TEAM_STATE is not held: it is a full snapshot that the next save re-sends.
+static bool IsDurablePacketType(const std::string& t) {
+    return t == "GIVE_ITEM" || t == "COMBO_CROSS_ITEM" || t == "SET_FLAG" || t == "UNSET_FLAG" ||
+           t == "SET_CHECK_STATUS" || t == "UPDATE_DUNGEON_ITEMS" || t == "UPDATE_BEANS_COUNT" ||
+           t == "ENTRANCE_DISCOVERED" || t == "GAME_COMPLETE";
+}
+
+static std::string PacketType(const std::string& packet) {
+    try {
+        return nlohmann::json::parse(packet).value("type", std::string());
+    } catch (...) { return std::string(); }
+}
+
+static std::filesystem::path OutboxPath() {
+    return ComboRando::SaveDir() / "coop-outbox.json";
+}
+
+// Hold sOutMutex. Persist the seed-scoped entries (temp + rename, like the save container). An entry
+// with an unknown seed stays memory-only: it could not be scoped safely on a later run.
+static void PersistOutboxLocked() {
+    sOutboxDirty = false;
+    std::error_code ec;
+    const auto path = OutboxPath();
+    nlohmann::json entries = nlohmann::json::array();
+    for (const auto& e : sOutbox) {
+        if (e.seed != 0)
+            entries.push_back({ { "seed", e.seed }, { "heldAt", e.heldAt }, { "packet", e.packet } });
+    }
+    if (entries.empty()) {
+        std::filesystem::remove(path, ec);
+        return;
+    }
+    std::filesystem::create_directories(path.parent_path(), ec);
+    auto tmp = path;
+    tmp += ".temp";
+    {
+        std::ofstream out(tmp, std::ios::trunc | std::ios::binary);
+        if (!out.is_open()) {
+            std::cerr << "[ComboShip][Anchor] cannot write " << path << " (held co-op items stay in memory)\n";
+            return;
+        }
+        out << nlohmann::json{ { "version", 1 }, { "entries", entries } }.dump();
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        std::filesystem::rename(tmp, path, ec);
+    }
+}
+
+// Network thread / shutdown: write the outbox if Send() added to it since the last write. Keeps disk IO
+// off the game thread (a flag-heavy area while offline would otherwise rewrite the file per flag).
+static void PersistOutboxIfDirty() {
+    std::lock_guard<std::mutex> lk(sOutMutex);
+    if (sOutboxDirty)
+        PersistOutboxLocked();
+}
+
+// Hold sOutMutex. Read packets a previous run held but never delivered (quit while offline).
+static void LoadOutboxFromDiskLocked() {
+    if (sOutboxDiskLoaded)
+        return;
+    sOutboxDiskLoaded = true;
+    std::ifstream in(OutboxPath());
+    if (!in.is_open())
+        return;
+    try {
+        nlohmann::json j;
+        in >> j;
+        const int64_t now = (int64_t)std::time(nullptr);
+        size_t loaded = 0;
+        for (const auto& e : j.value("entries", nlohmann::json::array())) {
+            OutboxEntry entry;
+            entry.seed = e.value("seed", 0u);
+            entry.heldAt = e.value("heldAt", (int64_t)0);
+            entry.packet = e.value("packet", std::string());
+            if (entry.seed == 0 || entry.packet.empty() || now - entry.heldAt > kOutboxMaxAgeSeconds)
+                continue;
+            sOutbox.push_back(std::move(entry));
+            loaded++;
+        }
+        std::cout << "[ComboShip][Anchor] restored " << loaded << " held co-op packet(s) from disk" << std::endl;
+    } catch (...) { std::cerr << "[ComboShip][Anchor] ignoring unreadable co-op outbox file\n"; }
+    sOutboxCount.store((int)sOutbox.size());
+}
+
+// Hold sOutMutex.
+static void OutboxPushLocked(const std::string& packet) {
+    if (sOutbox.size() >= kOutboxMaxEntries) {
+        std::cerr << "[ComboShip][Anchor] co-op outbox full, dropping oldest held packet\n";
+        sOutbox.pop_front();
+    }
+    sOutbox.push_back({ g_loadedMasterSeed.load(), (int64_t)std::time(nullptr), packet });
+    sOutboxCount.store((int)sOutbox.size());
+}
+
+// Network thread, while connected and after the handshake: move held packets of the loaded playthrough
+// into the send queue. Entries of another seed are dropped; entries whose seed can't be judged yet (no
+// slot loaded) wait. Returns how many were queued for sending.
+static int FlushOutbox() {
+    if (sOutboxCount.load() == 0)
+        return 0;
+    const uint32_t seed = g_loadedMasterSeed.load();
+    int sent = 0, dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(sOutMutex);
+        std::deque<OutboxEntry> keep;
+        for (auto& e : sOutbox) {
+            if (e.seed == 0 || e.seed == seed) {
+                sOutQueue.push(std::move(e.packet));
+                sent++;
+            } else if (seed != 0) {
+                dropped++; // held for a different playthrough than the one now loaded
+            } else {
+                keep.push_back(std::move(e)); // no slot loaded yet: can't tell, keep waiting
+            }
+        }
+        sOutbox.swap(keep);
+        sOutboxCount.store((int)sOutbox.size());
+        if (sent != 0 || dropped != 0)
+            PersistOutboxLocked();
+    }
+    if (sent != 0 || dropped != 0)
+        std::cout << "[ComboShip][Anchor] outbox flush: " << sent << " sent, " << dropped << " dropped (other seed)"
+                  << std::endl;
+    return sent;
+}
+
 // Combo-owned Anchor roster/presence. A game's Anchor only drains packets while it's the foreground
 // game, so its per-game roster goes stale when dormant. The launcher sees every packet on this
 // never-dormant thread, so it keeps ONE always-live roster the room window reads (display-only; games
@@ -1011,21 +1181,61 @@ static void ParseClient(const nlohmann::json& c, const std::string& originGame, 
 }
 
 // Parse the presence/room packets into the roster (called on the receive thread, before forwarding).
+// Co-op hardening (2026-11-13): a teammate's online flag flipped (or they joined/left the room).
+struct PresenceChange {
+    std::string name;
+    bool online;
+};
+
+// Hold sRosterMutex. Team of the self row (== gRemote.Anchor.TeamId), "default" until known.
+static std::string OwnTeamLocked() {
+    auto it = sRoster.find(sOwnClientId);
+    return it != sRoster.end() ? it->second.teamId : std::string("default");
+}
+
 static void UpdateRosterFromPacket(const std::string& packet) {
+    // Co-op hardening (2026-11-13): this runs for EVERY packet in both directions, including per-frame
+    // PLAYER_UPDATEs with whole joint tables. Only the three roster types matter, so skip the full JSON
+    // parse unless the text can be one of them.
+    if (packet.find("CLIENT_STATE\"") == std::string::npos && packet.find("ROOM_STATE\"") == std::string::npos)
+        return;
+    std::vector<PresenceChange> presence;
     try {
         auto pj = nlohmann::json::parse(packet);
         std::string type = pj.value("type", std::string());
         std::string origin = pj.value("originGame", std::string());
         if (type == "ALL_CLIENT_STATE") {
             std::lock_guard<std::mutex> lk(sRosterMutex);
-            sRoster.clear();
+            std::map<uint32_t, ClientInfo> prev;
+            prev.swap(sRoster);
             for (auto& c : pj.value("state", nlohmann::json::array())) {
                 ClientInfo info;
                 ParseClient(c, "", info); // array entries carry no originGame; sceneNum tags MM
                 if (c.value("self", false))
                     sOwnClientId = info.clientId;
+                if (!c.contains("online")) { // no presence info in this entry: keep the last known flag
+                    auto p = prev.find(info.clientId);
+                    info.online = p != prev.end() && p->second.online;
+                }
                 sRoster[info.clientId] = info;
             }
+            // Presence: the first roster after (re)connecting only seeds — never a burst of "online" toasts.
+            if (sPresenceSeeded) {
+                const std::string ownTeam = OwnTeamLocked();
+                for (auto& [cid, c] : sRoster) {
+                    if (cid == sOwnClientId || c.teamId != ownTeam)
+                        continue;
+                    auto p = prev.find(cid);
+                    bool wasOnline = p != prev.end() && p->second.online;
+                    if (wasOnline != c.online)
+                        presence.push_back({ c.name, c.online });
+                }
+                for (auto& [cid, c] : prev) {
+                    if (cid != sOwnClientId && c.online && c.teamId == ownTeam && !sRoster.count(cid))
+                        presence.push_back({ c.name, false }); // left the room entirely
+                }
+            }
+            sPresenceSeeded = true;
         } else if (type == "UPDATE_CLIENT_STATE") {
             uint32_t cid = pj.value("clientId", (uint32_t)0);
             if (cid != 0 && pj.contains("state")) {
@@ -1033,6 +1243,18 @@ static void UpdateRosterFromPacket(const std::string& packet) {
                 ClientInfo info;
                 ParseClient(pj["state"], origin, info);
                 info.clientId = cid;
+                auto p = sRoster.find(cid);
+                if (p != sRoster.end()) {
+                    // A state without an "online" field (our own outbound copy, some server notices) says
+                    // nothing about presence — keep what we had instead of reading it as "offline".
+                    if (!pj["state"].contains("online"))
+                        info.online = p->second.online;
+                    else if (sPresenceSeeded && cid != sOwnClientId && p->second.online != info.online &&
+                             info.teamId == OwnTeamLocked())
+                        presence.push_back({ info.name, info.online });
+                } else if (sPresenceSeeded && cid != sOwnClientId && info.online && info.teamId == OwnTeamLocked()) {
+                    presence.push_back({ info.name, true }); // joined after us
+                }
                 sRoster[cid] = info;
             }
         } else if (type == "UPDATE_ROOM_STATE" && pj.contains("state")) {
@@ -1046,6 +1268,12 @@ static void UpdateRosterFromPacket(const std::string& packet) {
         }
         // UPDATE_TEAM_STATE (save blob) + PLAYER_UPDATE (high-rate puppet coords) are display-irrelevant.
     } catch (...) {}
+    // Outside sRosterMutex: the toast export takes the game's own notification lock.
+    for (const auto& p : presence) {
+        const std::string who = (p.name.empty() || p.name == "???") ? std::string("Teammate") : p.name;
+        Toast(who.c_str(), p.online ? "is" : "went", p.online ? "online" : "offline",
+              "gRemote.Anchor.PartnerFeed.Presence");
+    }
 }
 
 // Roster snapshot for comboui's room window: { ownClientId, room{...}, clients[...] }. areaVisible +
@@ -1090,6 +1318,10 @@ static const char* Combo_Anchor_GetRoster() {
                         { "teleportMode", sRoomState.teleportMode },
                         { "syncItemsAndFlags", sRoomState.syncItemsAndFlags } };
         out["clients"] = clients;
+        // Co-op hardening (2026-11-13): link health for the network panel / diagnostics bundle.
+        out["link"] = { { "connected", sConnected.load() },
+                        { "enabled", sEnabled.load() },
+                        { "outboxPending", sOutboxCount.load() } };
         cached = out.dump();
     } catch (...) { cached = "{}"; }
     return cached.c_str();
@@ -1098,20 +1330,43 @@ static const char* Combo_Anchor_GetRoster() {
 // Background loop: connect, then relay outbound packets and feed inbound packets to the active
 // game. Mirrors soh's original Network::ReceiveFromServer framing (NUL-delimited JSON), only the
 // socket now lives in the launcher so it persists across transitions.
+//
+// Co-op hardening (2026-11-13):
+//  - waits up to kPollMs for inbound data instead of polling with a 0 timeout (the old loop spun one
+//    CPU core at 100% for the whole session);
+//  - a failed/short send ends the connection and moves every unsent save-affecting packet into the
+//    outbox, which is flushed after the next handshake, instead of silently losing it;
+//  - TCP keepalive (ComboNet_EnableKeepAlive) so a dead link (Wi-Fi drop, router reset) is noticed
+//    within ~30 s and reconnected, instead of hanging "connected" forever;
+//  - host resolution is retried (a DNS hiccup at boot used to disable Anchor for the whole session);
+//  - link toasts: lost / reconnected / held items delivered.
+constexpr int kPollMs = 5;
+
+// Hold sOutMutex. Everything still queued for a socket that just died: keep the save-affecting part.
+static void HoldUnsentLocked(std::queue<std::string>& unsent) {
+    while (!unsent.empty()) {
+        if (IsDurablePacketType(PacketType(unsent.front())))
+            OutboxPushLocked(unsent.front());
+        unsent.pop();
+    }
+}
+
 static void ReceiveLoop() {
     IPaddress address;
-    if (SDLNet_ResolveHost(&address, sHost.c_str(), sPort) == -1) {
-        std::cerr << "[ComboShip][Anchor] ResolveHost failed: " << SDLNet_GetError() << std::endl;
-        sEnabled = false;
-        return;
+    while (sEnabled && SDLNet_ResolveHost(&address, sHost.c_str(), sPort) == -1) {
+        std::cerr << "[ComboShip][Anchor] ResolveHost failed (retrying): " << SDLNet_GetError() << std::endl;
+        for (int i = 0; i < 50 && sEnabled; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     std::string received;
+    bool lostToastShown = false;
     while (sEnabled) {
         TCPsocket socket = nullptr;
         while (sEnabled && !socket) {
             socket = SDLNet_TCP_Open(&address);
             if (!socket && sEnabled) {
+                PersistOutboxIfDirty(); // packets held while offline survive a quit or crash
                 // Back off between attempts so an unreachable server doesn't spin a core at 100%.
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -1121,9 +1376,26 @@ static void ReceiveLoop() {
                 SDLNet_TCP_Close(socket);
             break;
         }
+        if (!ComboNet_EnableKeepAlive(socket))
+            std::cerr << "[ComboShip][Anchor] TCP keepalive unavailable; dead links are detected by send errors only\n";
 
         received.clear();
-        sConnected = true;
+        const bool reconnect = sEverConnected.exchange(true);
+        {
+            // Whatever the previous connection left unsent is stale ordering-wise (it would precede the
+            // new HANDSHAKE): hold the save-affecting part, drop the rest. Then go live.
+            std::lock_guard<std::mutex> lk(sOutMutex);
+            LoadOutboxFromDiskLocked();
+            std::queue<std::string> leftover;
+            leftover.swap(sOutQueue);
+            HoldUnsentLocked(leftover);
+            PersistOutboxLocked();
+            sConnected = true;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sRosterMutex);
+            sPresenceSeeded = false; // the first roster of this connection only seeds presence
+        }
         // OOT's OnConnected sends the room HANDSHAKE (establishes our client id) regardless of
         // which game is foreground. If MM is the active game (e.g. we connected while already in
         // MM, or resumed straight into it), also activate MM so it announces its presence — MM
@@ -1136,14 +1408,19 @@ static void ReceiveLoop() {
         // (dormant-safe), so a late-joiner/reconnect pulls the peer's OOT AND MM progress, and this
         // client's own dormant sibling gets asked too. Deferred to the game thread (finding 4).
         sResyncPending.store(true);
+        Toast("Co-op", reconnect ? "reconnected" : "connected", "", "gRemote.Anchor.PartnerFeed.Connection");
+        lostToastShown = false;
 
         SDLNet_SocketSet set = SDLNet_AllocSocketSet(1);
         SDLNet_TCP_AddSocket(set, socket);
 
         while (sEnabled && sConnected) {
-            int ready = SDLNet_CheckSockets(set, 0);
-            if (ready == -1)
-                break;
+            // Held packets go out right behind the HANDSHAKE (queued by OnConnected above), once the
+            // loaded slot proves they belong to this playthrough.
+            if (int flushed = FlushOutbox(); flushed > 0) {
+                std::string n = std::to_string(flushed) + (flushed == 1 ? " held update" : " held updates");
+                Toast("Co-op", "sent", n.c_str(), "gRemote.Anchor.PartnerFeed.Connection");
+            }
 
             // Drain outbound queue (packets handed to us by the game via Send()).
             std::queue<std::string> toSend;
@@ -1151,18 +1428,37 @@ static void ReceiveLoop() {
                 std::lock_guard<std::mutex> lk(sOutMutex);
                 toSend.swap(sOutQueue);
             }
+            bool sendFailed = false;
             while (!toSend.empty()) {
                 const std::string& p = toSend.front();
                 // Include the NUL delimiter in the framing (matches Network::SendDataToRemote).
-                SDLNet_TCP_Send(socket, p.c_str(), (int)p.size() + 1);
+                const int want = (int)p.size() + 1;
+                if (SDLNet_TCP_Send(socket, p.c_str(), want) < want) {
+                    std::cerr << "[ComboShip][Anchor] send failed: " << SDLNet_GetError() << std::endl;
+                    sendFailed = true;
+                    break;
+                }
                 toSend.pop();
             }
+            if (sendFailed) {
+                // The failed packet is still at toSend's front: it was never framed completely, so the
+                // server dropped it with the connection. Hold it and everything behind it.
+                std::lock_guard<std::mutex> lk(sOutMutex);
+                HoldUnsentLocked(toSend);
+                HoldUnsentLocked(sOutQueue);
+                PersistOutboxLocked();
+                sConnected = false;
+                break;
+            }
 
+            // Wait briefly for inbound data (also paces this loop; outbound latency stays <= kPollMs).
+            int ready = SDLNet_CheckSockets(set, kPollMs);
+            if (ready == -1)
+                break;
             if (ready == 0)
                 continue;
 
-            char buf[512];
-            memset(buf, 0, sizeof(buf));
+            char buf[4096];
             int len = SDLNet_TCP_Recv(socket, buf, sizeof(buf));
             if (len <= 0)
                 break;
@@ -1188,9 +1484,22 @@ static void ReceiveLoop() {
 
         SDLNet_FreeSocketSet(set);
         SDLNet_TCP_Close(socket);
-        sConnected = false;
+        {
+            // Packets the game queued after the last drain would otherwise sit in sOutQueue until the
+            // next connection; hold the save-affecting part now so it is persisted.
+            std::lock_guard<std::mutex> lk(sOutMutex);
+            sConnected = false;
+            HoldUnsentLocked(sOutQueue);
+            PersistOutboxLocked();
+        }
         if (SOH_Anchor_OnDisconnected)
             SOH_Anchor_OnDisconnected();
+        if (sEnabled && !lostToastShown) {
+            Toast("Co-op", "connection lost", "reconnecting...", "gRemote.Anchor.PartnerFeed.Connection");
+            lostToastShown = true;
+        }
+        if (sEnabled) // don't hammer the server if it closes us right after accepting
+            std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -1205,6 +1514,7 @@ static void Connect(const char* host, uint16_t port) {
     }
     sHost = host ? host : "";
     sPort = port;
+    sEverConnected = false;
     sEnabled = true;
     if (sThread.joinable())
         sThread.join();
@@ -1222,6 +1532,10 @@ static void Disconnect() {
     std::lock_guard<std::mutex> lk(sOutMutex);
     std::queue<std::string> empty;
     sOutQueue.swap(empty);
+    if (sOutboxDirty)
+        PersistOutboxLocked(); // held while the loop was already gone (or between its last write and exit)
+    // The outbox is kept (memory + disk): turning co-op off and on again, or quitting, must not lose
+    // progress a teammate hasn't received yet. It is flushed on the next connection to this seed.
 }
 
 // Registered into the game as the send callback (Network::SendDataToRemote redirects here).
@@ -1232,7 +1546,19 @@ static void Send(const char* json) {
     // self roster row would freeze at its join value.
     UpdateRosterFromPacket(json);
     std::lock_guard<std::mutex> lk(sOutMutex);
-    sOutQueue.push(json);
+    if (sConnected) {
+        sOutQueue.push(json);
+        return;
+    }
+    // Co-op hardening (2026-11-13): disconnected. Hold save-affecting packets for the next connection;
+    // drop live-only ones (MM keeps sending poses while offline, which used to pile up unbounded here).
+    if (!sEnabled)
+        return;
+    std::string packet(json);
+    if (IsDurablePacketType(PacketType(packet))) {
+        OutboxPushLocked(packet);
+        sOutboxDirty = true; // written to disk by the network thread (PersistOutboxIfDirty), not here
+    }
 }
 
 // Called during launcher shutdown, BEFORE any game DLL is unloaded: the receive thread calls
@@ -1365,6 +1691,7 @@ static void LoadComboCompletion(int slot) {
         g_startingGameMM = rando.value("startingGame", std::string("OOT")) == "MM";
         // Shared Items: absent key = mask 0 = feature off (old seeds unaffected).
         g_sharedMask = ComboRando::SharedMaskFromKeys(rando.value("sharedItems", nlohmann::json::array()));
+        g_loadedMasterSeed.store(rando.value("masterSeed", 0u)); // co-op outbox scope
     }
     // Push outside the container lock — the DLL setters must never re-enter the sidecar.
     if (SOH_SetComboGoal)
@@ -3015,6 +3342,66 @@ static int LauncherValidateShipConfig(const char* path) {
 
 // ---------- Entry point ----------
 
+// Co-op hardening (2026-11-13): rolling backup of every save container at launch, BEFORE either game
+// can write. A co-op resync deliberately overwrites receiver-local values (HP, rupees, ...) and a bad
+// peer state or a bug could do worse; this keeps the last kSaveBackupsKept launches restorable by hand:
+// close the game, copy Save/backups/<time>/fileN.combosav back over Save/fileN.combosav.
+// Best-effort: any failure is logged and the launch continues.
+static void BackupSaveContainersOnLaunch() {
+    constexpr size_t kSaveBackupsKept = 10;
+    try {
+        std::error_code ec;
+        const auto saveDir = ComboRando::SaveDir();
+        if (!std::filesystem::is_directory(saveDir, ec))
+            return;
+        std::vector<std::filesystem::path> files;
+        for (const auto& e : std::filesystem::directory_iterator(saveDir, ec)) {
+            if (e.is_regular_file(ec) && e.path().extension() == ".combosav")
+                files.push_back(e.path());
+        }
+        if (files.empty())
+            return;
+
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+#ifdef _WIN32
+        localtime_s(&local, &now);
+#else
+        localtime_r(&now, &local);
+#endif
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &local);
+        const auto root = saveDir / "backups";
+        const auto dest = root / stamp;
+        std::filesystem::create_directories(dest, ec);
+        if (ec) {
+            std::cerr << "[ComboShip] save backup skipped: cannot create " << dest << " (" << ec.message() << ")\n";
+            return;
+        }
+        size_t copied = 0;
+        for (const auto& f : files) {
+            std::filesystem::copy_file(f, dest / f.filename(), std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec)
+                std::cerr << "[ComboShip] save backup: cannot copy " << f << " (" << ec.message() << ")\n";
+            else
+                copied++;
+        }
+        std::cout << "[ComboShip] backed up " << copied << " save file(s) to " << dest.string() << std::endl;
+
+        // Prune: timestamped names sort chronologically, keep the newest kSaveBackupsKept.
+        std::vector<std::filesystem::path> sets;
+        for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+            if (e.is_directory(ec))
+                sets.push_back(e.path());
+        }
+        std::sort(sets.begin(), sets.end());
+        for (size_t i = 0; i + kSaveBackupsKept < sets.size(); i++)
+            std::filesystem::remove_all(sets[i], ec);
+    } catch (const std::exception& e) {
+        std::cerr << "[ComboShip] save backup failed: " << e.what() << std::endl;
+    } catch (...) { std::cerr << "[ComboShip] save backup failed\n"; }
+}
+
 int main(int argc, char** argv) {
     std::cout << "ComboShip Launcher - Starting..." << std::endl;
 
@@ -3029,6 +3416,7 @@ int main(int argc, char** argv) {
 #endif
 
     std::set_terminate(ComboTerminateHandler);
+    BackupSaveContainersOnLaunch(); // co-op hardening: before any game can write a save
 
     // --- 1. Load DLLs ---
 
@@ -3165,6 +3553,8 @@ int main(int argc, char** argv) {
     MM_SetPumpDormant = (FnSetPumpDormant)GetSym(mmModule, "MM_SetPumpDormant");
     SOH_Anchor_PumpDormant = (FnVoidArgless)GetSym(sohModule, "SOH_Anchor_PumpDormant");
     MM_Anchor_PumpDormant = (FnVoidArgless)GetSym(mmModule, "MM_Anchor_PumpDormant");
+    SOH_ComboToast = (FnComboToast)GetSym(sohModule, "SOH_ComboToast");
+    MM_ComboToast = (FnComboToast)GetSym(mmModule, "MM_ComboToast");
 
     // Cross-game item delivery seam (issue #3)
     SOH_SetCrossDeliver = (FnSetCrossDeliver)GetSym(sohModule, "SOH_SetCrossDeliver");

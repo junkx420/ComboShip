@@ -8,11 +8,16 @@
 #pragma once
 
 #include <ship/window/gui/GuiWindow.h>
+#include <string>
 
 namespace ComboRando {
 
 // Registered in ComboUI_Register alongside the tracker windows; toggled from the combo Anchor panel.
 void RegisterAnchorRoomWindow();
+
+// Co-op hardening (2026-11-13): raw launcher roster snapshot (incl. "link" health), "{}" if the launcher
+// has not registered its provider. For the network panel status line and the diagnostics bundle.
+std::string AnchorRosterJson();
 
 class ComboAnchorRoomWindow final : public Ship::GuiWindow {
   public:
