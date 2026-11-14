@@ -9,9 +9,6 @@
 > - The goal is to offer these changes to the original project. Once they are merged there (or turned down), please use the official ComboShip, not this fork.
 > - Parts of this fork were written with AI assistance.
 
-> [!NOTE]
-> **Deutsch:** Das hier ist **nicht** das offizielle ComboShip, sondern ein privates Fan-Projekt. **Alle Credits gehören [Varuuna](https://github.com/Varuuna) und den Mitwirkenden von [ComboShip](https://github.com/Varuuna/ComboShip).** Kein Bezug zu den ComboShip-Entwicklern, HarbourMasters oder 2 Ship 2 Harkinian. Fehler aus diesem Fork bitte hier melden, nicht beim Original.
-
 ## Why this fork exists
 
 My friend and I play ComboShip co-op over Anchor, usually split across the two games: one of us mostly in Ocarina of Time, the other mostly in Majora's Mask, and we switch when one game runs out of checks. In that setup a couple of things felt disconnected, so this fork tries to make split play feel like one shared run.
@@ -40,8 +37,6 @@ Builds are made by GitHub Actions:
 
 - **Releases:** see the [Releases page](../../releases), if a release exists.
 - **Latest CI build:** open the newest successful run under [Actions](../../actions), scroll to **Artifacts** and download the archive for your system (`ComboShip-windows`, `ComboShip-linux` / `ComboShip-linux-appimage`, `ComboShip-macos`).
-
-While this repository is private, you need to be invited as a collaborator and signed in to GitHub to download anything.
 
 Like the original, ComboShip needs your own legally dumped Ocarina of Time and Majora's Mask ROMs. No game data is included or shared here.
 
