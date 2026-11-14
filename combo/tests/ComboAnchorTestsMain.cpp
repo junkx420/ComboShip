@@ -7,6 +7,7 @@
 int main() {
     RunOutboxTests();
     RunDeliveryTests();
+    RunMmFlagTests();
 
     if (ComboTest::gFailures != 0) {
         std::cerr << ComboTest::gFailures << " of " << ComboTest::gChecks << " checks FAILED\n";

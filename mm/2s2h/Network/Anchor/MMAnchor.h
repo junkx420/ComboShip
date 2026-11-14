@@ -11,6 +11,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <libultraship/libultraship.h>
+#include "2s2h/GameInteractor/GameInteractor.h" // FlagType (flag hook signatures)
 
 extern "C" {
 #include "variables.h"
@@ -153,6 +154,23 @@ class MMAnchor {
     void ApplyDormantGiveItem(const nlohmann::json& payload);     // A6: dormant-safe co-op item apply
     void HandlePacket_UpdateTeamState(nlohmann::json& payload);   // mutates payload (rando check unpack)
     void ReplayTeamStateQueue(const nlohmann::json& payload);     // co-op next: the "queue" of a team state
+
+    // Co-op next block 3 (2026-11-14): MM flag sync — only flags the game keeps across a cycle reset.
+    // Rules and packet vocabulary: combo/net/ComboAnchorMmFlags.h. Defined at the end of MMAnchor.cpp.
+    bool CanSendProgress();
+    void OnLocalSceneFlagSet(s16 sceneId, FlagType flagType, u32 flag);
+    void OnLocalWeekEventSet(u32 flag);
+    void PollOwlStatues();
+    void SendPacket_MmFlag(const char* kind, int scene, int flag);
+    void HandlePacket_MmFlag(const nlohmann::json& payload);
+    // ORs the PERSISTENT part of the given scene flag words into the working copy (cycleSceneFlags),
+    // the save copy (permanentSceneFlags) and, in the foreground, the live scene. True if anything changed.
+    bool ApplyPersistentSceneBits(int sceneIdx, u32 chest, u32 switch0, u32 switch1, u32 collectible);
+    // Team-state sender: bring a Save copy's permanentSceneFlags up to date with what is only in the
+    // working copy / the live scene so far (the game copies those over on its own saves only).
+    void OverlayPersistentSceneFlags(Save& out);
+    u16 lastOwlFlags = 0;       // owl statues already announced (PollOwlStatues)
+    bool owlPollPrimed = false; // false = take the current flags as the baseline, announce nothing
     void HandlePacket_RequestTeamState(const nlohmann::json& payload);
     // Co-op next (2026-11-13): honour the room's "sync items and flags" setting (foreground + dormant).
     void HandlePacket_UpdateRoomState(const nlohmann::json& payload);

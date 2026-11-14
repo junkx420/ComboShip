@@ -39,7 +39,7 @@ struct OutboxEntry {
 inline bool IsDurablePacketType(const std::string& t) {
     return t == "GIVE_ITEM" || t == "COMBO_CROSS_ITEM" || t == "SET_FLAG" || t == "UNSET_FLAG" ||
            t == "SET_CHECK_STATUS" || t == "UPDATE_DUNGEON_ITEMS" || t == "UPDATE_BEANS_COUNT" ||
-           t == "ENTRANCE_DISCOVERED" || t == "GAME_COMPLETE";
+           t == "ENTRANCE_DISCOVERED" || t == "GAME_COMPLETE" || t == "COMBO_MM_FLAG";
 }
 
 // Value of a top-level string field of a JSON object packet, or "" for anything else (not JSON, not

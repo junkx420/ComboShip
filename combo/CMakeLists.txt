@@ -153,6 +153,7 @@ add_executable(combo_anchor_tests EXCLUDE_FROM_ALL
     tests/ComboAnchorTestsMain.cpp
     tests/ComboAnchorOutboxTest.cpp
     tests/ComboAnchorDeliveryTest.cpp
+    tests/ComboAnchorMmFlagsTest.cpp
 )
 target_include_directories(combo_anchor_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(combo_anchor_tests PRIVATE nlohmann_json::nlohmann_json)

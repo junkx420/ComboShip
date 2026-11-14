@@ -47,6 +47,7 @@ inline bool MightBeDurable(const char* text) {
         "\"type\":\"GIVE_ITEM\"",          "\"type\":\"COMBO_CROSS_ITEM\"",    "\"type\":\"SET_FLAG\"",
         "\"type\":\"UNSET_FLAG\"",         "\"type\":\"SET_CHECK_STATUS\"",    "\"type\":\"UPDATE_DUNGEON_ITEMS\"",
         "\"type\":\"UPDATE_BEANS_COUNT\"", "\"type\":\"ENTRANCE_DISCOVERED\"", "\"type\":\"GAME_COMPLETE\"",
+        "\"type\":\"COMBO_MM_FLAG\"",
     };
     for (const char* needle : kNeedles) {
         if (std::strstr(text, needle) != nullptr)

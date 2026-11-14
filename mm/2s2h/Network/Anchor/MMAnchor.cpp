@@ -2,8 +2,10 @@
 #ifdef COMBO_BUILD
 #include "ComboExport.h"
 
+#include <memory>
 #include <spdlog/spdlog.h>
 #include "rando/ComboAnchorToast.h" // shared cross-game resync-toast debounce
+#include "net/ComboAnchorMmFlags.h" // MM flag sync: packet vocabulary + bit rules (unit-tested)
 #include "2s2h/GameInteractor/GameInteractor.h"
 #include "2s2h/NameTag/NameTag.h"
 #include "2s2h/Rando/Rando.h" // Rando::GiveItem / ConvertItem / CurrentJunkItem / RANDO_SAVE_CHECKS / IS_RANDO
@@ -44,6 +46,8 @@ static const std::string PKT_REQUEST_TEAM_STATE = "REQUEST_TEAM_STATE";
 // Co-op next (2026-11-13): the room owner's settings. Sent by the server after the handshake and by
 // soh's Anchor when the owner changes them (neither copy carries originGame, so both pass our filter).
 static const std::string PKT_UPDATE_ROOM_STATE = "UPDATE_ROOM_STATE";
+// Co-op next block 3 (2026-11-14): MM flag sync (see the end of this file).
+static const std::string PKT_MM_FLAG = ComboAnchorCore::kMmFlagPacketType;
 // Issue #3: cross-game item delivery. ComboShip-private packet type (the public server relays unknown
 // types peer-to-peer, so no server change is needed).
 static const std::string PKT_CROSS_ITEM = "COMBO_CROSS_ITEM";
@@ -169,6 +173,20 @@ void MMAnchor::RegisterHooks() {
                 pendingCycleSaveBroadcast = false;
                 SendPacket_UpdateTeamState(CVarGetString(kCvarTeamId, "default"));
             }
+            PollOwlStatues(); // block 3: owl activations have no hook
+        }
+    });
+
+    // Block 3: flag sync. Both hooks fire only on a real off -> on change made by the game; remote
+    // flags are written straight into the save (HandlePacket_MmFlag), so they never come back here.
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneFlagSet>([this](s16 scene, FlagType t, u32 f) {
+        if (isActive) {
+            OnLocalSceneFlagSet(scene, t, f);
+        }
+    });
+    GameInteractor::Instance->RegisterGameHook<GameInteractor::OnFlagSet>([this](FlagType flagType, u32 flag) {
+        if (isActive && flagType == FLAG_WEEK_EVENT_REG) {
+            OnLocalWeekEventSet(flag);
         }
     });
 
@@ -255,6 +273,8 @@ void MMAnchor::ProcessIncomingPacketQueue() {
                 HandlePacket_RequestTeamState(payload);
             } else if (type == PKT_UPDATE_ROOM_STATE) {
                 HandlePacket_UpdateRoomState(payload);
+            } else if (type == PKT_MM_FLAG) {
+                HandlePacket_MmFlag(payload);
             } else if (type == PKT_REQUEST_TELEPORT) {
                 HandlePacket_RequestTeleport(payload);
             } else if (type == PKT_TELEPORT_TO) {
@@ -314,6 +334,10 @@ void MMAnchor::PumpDormant() {
                 SPDLOG_INFO("[MMAnchor] dormant UPDATE_TEAM_STATE received");
                 DormantApplyGuard guard(this);
                 HandlePacket_UpdateTeamState(payload); // sets dormantDidApply only on a true commit
+            } else if (payload.value("type", std::string()) == PKT_MM_FLAG) {
+                // Block 3: save-only writes (no gPlayState needed); sets dormantDidApply on a change.
+                DormantApplyGuard guard(this);
+                HandlePacket_MmFlag(payload);
             }
         } catch (const std::exception& e) { SPDLOG_ERROR("[MMAnchor] dormant apply exception: {}", e.what()); }
     }
@@ -913,7 +937,14 @@ void MMAnchor::SendTeamStateFromSave(const std::string& targetTeamId) {
     payload["type"] = PKT_UPDATE_TEAM_STATE;
     payload["targetTeamId"] = targetTeamId;
     payload["queue"] = nlohmann::json::array(); // assume our team queue is now empty
-    payload["state"] = gSaveContext.save;       // to_json(Save) from BenJsonConversions
+    {
+        // Block 3: the game copies scene flags into the Save only when it saves, so gSaveContext.save
+        // alone would report every chest opened since then as closed. Send a copy with the persistent
+        // part brought up to date (heap: a Save holds the whole rando check table).
+        auto snapshot = std::make_unique<Save>(gSaveContext.save);
+        OverlayPersistentSceneFlags(*snapshot);
+        payload["state"] = *snapshot; // to_json(Save) from BenJsonConversions
+    }
 
     // Byte-reduction: replace the rando check array with a compact array-of-arrays. 7 fields here —
     // ComboShip's RandoSaveCheck has no multiWorldTeamIndex (shared-progression, not multiworld).
@@ -1015,6 +1046,8 @@ void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
     u32 localQuestItems = gSaveContext.save.saveInfo.inventory.questItems;
     u32 localUpgrades = gSaveContext.save.saveInfo.inventory.upgrades;
     s16 localHealthCapacity = gSaveContext.save.saveInfo.playerData.healthCapacity;
+    // Block 3: owl statues are permanent too — the playerData replace must not deactivate one.
+    u16 localOwlFlags = gSaveContext.save.saveInfo.playerData.owlActivationFlags;
     // Bug 4/5: rupees/magic regress on the wholesale saveInfo replace — snapshot to re-max after.
     s16 localRupees = gSaveContext.save.saveInfo.playerData.rupees;
     s8 localMagic = gSaveContext.save.saveInfo.playerData.magic;
@@ -1122,6 +1155,9 @@ void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
     if (localHealthCapacity > gSaveContext.save.saveInfo.playerData.healthCapacity) {
         gSaveContext.save.saveInfo.playerData.healthCapacity = localHealthCapacity;
     }
+    gSaveContext.save.saveInfo.playerData.owlActivationFlags =
+        static_cast<u16>(gSaveContext.save.saveInfo.playerData.owlActivationFlags | localOwlFlags);
+    owlPollPrimed = false; // the merged statues are the new baseline, not something to announce
     // Bug 4/5: take the higher rupees/magic (magic only once a meter exists; don't set it barefoot).
     if (localRupees > gSaveContext.save.saveInfo.playerData.rupees) {
         gSaveContext.save.saveInfo.playerData.rupees = localRupees;
@@ -1140,6 +1176,14 @@ void MMAnchor::HandlePacket_UpdateTeamState(nlohmann::json& payload) {
         cur.collectible |= localPermSceneFlags[i].collectible;
         cur.unk_14 |= localPermSceneFlags[i].unk_14; // dungeon floors visited
         cur.rooms |= localPermSceneFlags[i].rooms;
+    }
+    // Block 3: the merge above only reaches the Save. The game works on cycleSceneFlags (loaded from
+    // the Save once, copied back over it on every save) and on the live scene, so without this the
+    // team's opened chests stayed closed here and were overwritten by our next save. Persistent bits
+    // only: a teammate's cycle-bound flags must not leak into our cycle.
+    for (int i = 0; i < SCENE_MAX; i++) {
+        const PermanentSceneFlags& merged = gSaveContext.save.saveInfo.permanentSceneFlags[i];
+        ApplyPersistentSceneBits(i, merged.chest, merged.switch0, merged.switch1, merged.collectible);
     }
     // Max/OR-merge the key + fairy + dungeon-item counters back (OOT precedent: UpdateTeamState.cpp).
     // Accepted: a stale peer resync can re-grant a locally-spent small key.
@@ -1304,6 +1348,268 @@ void MMAnchor::HandlePacket_TeleportTo(const nlohmann::json& payload) {
     gSaveContext.respawn[RESPAWN_MODE_DOWN].playerParams = PLAYER_PARAMS(0xFF, PLAYER_START_MODE_D);
     gSaveContext.nextTransitionType = TRANS_TYPE_FADE_BLACK_FAST;
     gSaveContext.respawnFlag = -8;
+}
+
+// MARK: - Flag sync (co-op next block 3, 2026-11-14)
+//
+// What is shared, and why only that, is described in combo/net/ComboAnchorMmFlags.h: the flags the
+// game itself keeps across a Song of Time reset. Set-only, so a replay (outbox, server queue) is
+// harmless and nothing here can undo a teammate's progress.
+//
+// Sending: the game's own flag hooks (OnSceneFlagSet / OnFlagSet fire on a real off -> on change) and
+// a per-frame poll for owl statues, which have no hook.
+// Receiving: written straight into the save, never through Flags_Set*: the rando marks a check
+// "eligible" from those hooks and would grant the teammate's check a second time here. The item
+// itself arrives through GIVE_ITEM, which also marks the check obtained.
+
+// The game's persistence tables (mm/src/code/z_sram_NES.c). They are plain globals there but have no
+// header, so they are declared here with the same layout; no vendored edit needed.
+extern "C" {
+typedef struct PersistentCycleSceneFlags {
+    /* 0x0 */ u32 switch0;
+    /* 0x4 */ u32 switch1;
+    /* 0x8 */ u32 chest;
+    /* 0xC */ u32 collectible;
+} PersistentCycleSceneFlags; // size = 0x10
+extern PersistentCycleSceneFlags sPersistentCycleSceneFlags[SCENE_MAX];
+extern u16 sPersistentCycleWeekEventRegs[ARRAY_COUNT(gSaveContext.save.saveInfo.weekEventReg)];
+}
+
+// Collectible flags of the Inverted Stone Tower Temple are stored under its own scene id; everything
+// else under the "original" scene (Play_SaveCycleSceneFlags / Actor_InitContext).
+static int MmFlagSceneIndex(s16 sceneId, bool collectible) {
+    if (collectible && sceneId == SCENE_INISIE_R) {
+        return sceneId;
+    }
+    return Play_GetOriginalSceneId(sceneId);
+}
+
+bool MMAnchor::CanSendProgress() {
+    return isActive && roomState.syncItemsAndFlags && IsSaveLoaded() && HasLoadedRandoSave();
+}
+
+void MMAnchor::OnLocalSceneFlagSet(s16 sceneId, FlagType flagType, u32 flag) {
+    if (!CanSendProgress() || sceneId < 0 || sceneId >= SCENE_MAX || flag > 127) {
+        return;
+    }
+    const int flagId = static_cast<int>(flag);
+    u32 bit = 0;
+    if (flagType == FLAG_CYCL_SCENE_CHEST) {
+        const int idx = MmFlagSceneIndex(sceneId, false);
+        if (ComboAnchorCore::ChestFlagBit(flagId, bit) && (sPersistentCycleSceneFlags[idx].chest & bit) != 0) {
+            SendPacket_MmFlag(ComboAnchorCore::kMmFlagChest, idx, flagId);
+        }
+    } else if (flagType == FLAG_CYCL_SCENE_SWITCH) {
+        const int idx = MmFlagSceneIndex(sceneId, false);
+        int word = 0;
+        if (ComboAnchorCore::SwitchFlagBit(flagId, word, bit)) {
+            const PersistentCycleSceneFlags& keep = sPersistentCycleSceneFlags[idx];
+            if (((word == 0 ? keep.switch0 : keep.switch1) & bit) != 0) {
+                SendPacket_MmFlag(ComboAnchorCore::kMmFlagSwitch, idx, flagId);
+            }
+        }
+    } else if (flagType == FLAG_CYCL_SCENE_COLLECTIBLE) {
+        const int idx = MmFlagSceneIndex(sceneId, true);
+        if (ComboAnchorCore::CollectibleFlagBit(flagId, bit) &&
+            (sPersistentCycleSceneFlags[idx].collectible & bit) != 0) {
+            SendPacket_MmFlag(ComboAnchorCore::kMmFlagCollectible, idx, flagId);
+        }
+    }
+    // FLAG_CYCL_SCENE_CLEARED_ROOM: reset with every cycle, never shared.
+}
+
+void MMAnchor::OnLocalWeekEventSet(u32 flag) {
+    if (!CanSendProgress()) {
+        return;
+    }
+    const u32 index = flag >> 8;
+    if (index >= ARRAY_COUNT(gSaveContext.save.saveInfo.weekEventReg)) {
+        return;
+    }
+    const u8 persistent = ComboAnchorCore::WeekEventPersistMask(sPersistentCycleWeekEventRegs[index]);
+    if ((flag & 0xFF & persistent) == 0) {
+        return; // a cycle-bound flag: this player's three days only
+    }
+    SendPacket_MmFlag(ComboAnchorCore::kMmFlagWeekEventReg, 0, static_cast<int>(flag));
+}
+
+// Owl statue activation is a bare macro in the game (SET_OWL_STATUE_ACTIVATED), so there is nothing to
+// hook. Compare against the last announced value once per frame instead. The baseline is retaken
+// (nothing announced) whenever no save is in play, after a team-state merge and after a remote flag.
+void MMAnchor::PollOwlStatues() {
+    if (!IsSaveLoaded() || !HasLoadedRandoSave()) {
+        owlPollPrimed = false;
+        return;
+    }
+    const u16 statueMask = static_cast<u16>((1 << (OWL_WARP_STONE_TOWER + 1)) - 1);
+    const u16 current = static_cast<u16>(gSaveContext.save.saveInfo.playerData.owlActivationFlags & statueMask);
+    if (!owlPollPrimed) {
+        lastOwlFlags = current;
+        owlPollPrimed = true;
+        return;
+    }
+    const u16 fresh = static_cast<u16>(current & ~lastOwlFlags);
+    lastOwlFlags = current;
+    if (fresh == 0 || !roomState.syncItemsAndFlags) {
+        return;
+    }
+    for (int owl = 0; owl <= OWL_WARP_STONE_TOWER; owl++) {
+        if ((fresh & (1 << owl)) != 0) {
+            SendPacket_MmFlag(ComboAnchorCore::kMmFlagOwl, 0, owl);
+        }
+    }
+}
+
+void MMAnchor::SendPacket_MmFlag(const char* kind, int scene, int flag) {
+    nlohmann::json payload;
+    payload["type"] = PKT_MM_FLAG;
+    payload["targetTeamId"] = CVarGetString(kCvarTeamId, "default");
+    payload["addToQueue"] = true; // set-only and idempotent, so a server-queue replay is safe
+    payload["kind"] = kind;
+    payload["scene"] = scene;
+    payload["flag"] = flag;
+    payload["quiet"] = true;
+    SendJson(payload);
+}
+
+// OR `bits` into `word`; true if that changed it.
+static bool MmOrBits(u32& word, u32 bits) {
+    if ((word | bits) == word) {
+        return false;
+    }
+    word |= bits;
+    return true;
+}
+
+bool MMAnchor::ApplyPersistentSceneBits(int sceneIdx, u32 chest, u32 switch0, u32 switch1, u32 collectible) {
+    if (sceneIdx < 0 || sceneIdx >= SCENE_MAX) {
+        return false;
+    }
+    const PersistentCycleSceneFlags& keep = sPersistentCycleSceneFlags[sceneIdx];
+    chest &= keep.chest;
+    switch0 &= keep.switch0;
+    switch1 &= keep.switch1;
+    collectible &= keep.collectible;
+    if ((chest | switch0 | switch1 | collectible) == 0) {
+        return false;
+    }
+
+    bool changed = false;
+    // The working copy the game loads a scene from, and the Save it is copied into on every save.
+    CycleSceneFlags& cycle = gSaveContext.cycleSceneFlags[sceneIdx];
+    PermanentSceneFlags& perm = gSaveContext.save.saveInfo.permanentSceneFlags[sceneIdx];
+    changed |= MmOrBits(cycle.chest, chest);
+    changed |= MmOrBits(cycle.switch0, switch0);
+    changed |= MmOrBits(cycle.switch1, switch1);
+    changed |= MmOrBits(cycle.collectible, collectible);
+    changed |= MmOrBits(perm.chest, chest);
+    changed |= MmOrBits(perm.switch0, switch0);
+    changed |= MmOrBits(perm.switch1, switch1);
+    changed |= MmOrBits(perm.collectible, collectible);
+
+    // Foreground: the scene the player stands in works on its own copy, which is written back over
+    // cycleSceneFlags when the scene is left. Dormant MM has no play state.
+    if (!isDormantApply && gPlayState != nullptr) {
+        ActorContextSceneFlags& live = gPlayState->actorCtx.sceneFlags;
+        if (MmFlagSceneIndex(gPlayState->sceneId, false) == sceneIdx) {
+            changed |= MmOrBits(live.chest, chest);
+            changed |= MmOrBits(live.switches[0], switch0);
+            changed |= MmOrBits(live.switches[1], switch1);
+        }
+        if (MmFlagSceneIndex(gPlayState->sceneId, true) == sceneIdx) {
+            changed |= MmOrBits(live.collectible[0], collectible);
+        }
+    }
+    return changed;
+}
+
+void MMAnchor::OverlayPersistentSceneFlags(Save& out) {
+    for (int i = 0; i < SCENE_MAX; i++) {
+        const PersistentCycleSceneFlags& keep = sPersistentCycleSceneFlags[i];
+        const CycleSceneFlags& cycle = gSaveContext.cycleSceneFlags[i];
+        PermanentSceneFlags& perm = out.saveInfo.permanentSceneFlags[i];
+        perm.chest |= cycle.chest & keep.chest;
+        perm.switch0 |= cycle.switch0 & keep.switch0;
+        perm.switch1 |= cycle.switch1 & keep.switch1;
+        perm.collectible |= cycle.collectible & keep.collectible;
+    }
+    if (gPlayState == nullptr || GET_PLAYER(gPlayState) == nullptr) {
+        return; // dormant: the working copy is all there is
+    }
+    const ActorContextSceneFlags& live = gPlayState->actorCtx.sceneFlags;
+    const int idx = MmFlagSceneIndex(gPlayState->sceneId, false);
+    if (idx >= 0 && idx < SCENE_MAX) {
+        PermanentSceneFlags& perm = out.saveInfo.permanentSceneFlags[idx];
+        perm.chest |= live.chest & sPersistentCycleSceneFlags[idx].chest;
+        perm.switch0 |= live.switches[0] & sPersistentCycleSceneFlags[idx].switch0;
+        perm.switch1 |= live.switches[1] & sPersistentCycleSceneFlags[idx].switch1;
+    }
+    const int collectIdx = MmFlagSceneIndex(gPlayState->sceneId, true);
+    if (collectIdx >= 0 && collectIdx < SCENE_MAX) {
+        out.saveInfo.permanentSceneFlags[collectIdx].collectible |=
+            live.collectible[0] & sPersistentCycleSceneFlags[collectIdx].collectible;
+    }
+}
+
+// Foreground and dormant (PumpDormant sets isDormantApply around it). Every value is re-validated
+// here against this client's own persistence tables: a packet can never set a cycle-bound flag.
+void MMAnchor::HandlePacket_MmFlag(const nlohmann::json& payload) {
+    if (!roomState.syncItemsAndFlags || !HasLoadedRandoSave()) {
+        return;
+    }
+    const uint32_t clientId = payload.value("clientId", (uint32_t)0);
+    if (clientId != 0 && clientId == ownClientId) {
+        return; // our own broadcast
+    }
+    if (payload.value("targetTeamId", std::string("default")) != CVarGetString(kCvarTeamId, "default")) {
+        return;
+    }
+    const std::string kind = payload.value("kind", std::string());
+    const int scene = payload.value("scene", -1);
+    const int flag = payload.value("flag", -1);
+    bool changed = false;
+    u32 bit = 0;
+
+    if (kind == ComboAnchorCore::kMmFlagChest) {
+        if (ComboAnchorCore::ChestFlagBit(flag, bit)) {
+            changed = ApplyPersistentSceneBits(scene, bit, 0, 0, 0);
+        }
+    } else if (kind == ComboAnchorCore::kMmFlagSwitch) {
+        int word = 0;
+        if (ComboAnchorCore::SwitchFlagBit(flag, word, bit)) {
+            changed = word == 0 ? ApplyPersistentSceneBits(scene, 0, bit, 0, 0)
+                                : ApplyPersistentSceneBits(scene, 0, 0, bit, 0);
+        }
+    } else if (kind == ComboAnchorCore::kMmFlagCollectible) {
+        if (ComboAnchorCore::CollectibleFlagBit(flag, bit)) {
+            changed = ApplyPersistentSceneBits(scene, 0, 0, 0, bit);
+        }
+    } else if (kind == ComboAnchorCore::kMmFlagWeekEventReg) {
+        const int index = flag >> 8;
+        if (flag >= 0 && index < (int)ARRAY_COUNT(gSaveContext.save.saveInfo.weekEventReg)) {
+            const u8 persistent = ComboAnchorCore::WeekEventPersistMask(sPersistentCycleWeekEventRegs[index]);
+            const u8 bits = static_cast<u8>(flag & 0xFF & persistent);
+            u8& reg = gSaveContext.save.saveInfo.weekEventReg[index];
+            if (bits != 0 && (reg & bits) != bits) {
+                reg = static_cast<u8>(reg | bits);
+                changed = true;
+            }
+        }
+    } else if (kind == ComboAnchorCore::kMmFlagOwl) {
+        if (flag >= 0 && flag <= OWL_WARP_STONE_TOWER) {
+            u16& owls = gSaveContext.save.saveInfo.playerData.owlActivationFlags;
+            const u16 owlBit = static_cast<u16>(1 << flag);
+            if ((owls & owlBit) == 0) {
+                owls = static_cast<u16>(owls | owlBit);
+                changed = true;
+            }
+            owlPollPrimed = false; // new baseline: don't announce a teammate's statue as ours
+        }
+    }
+
+    if (changed && isDormantApply) {
+        dormantDidApply = true; // PumpDormant persists once after draining its queue
+    }
 }
 
 // MARK: - Launcher-facing C ABI (mirrors soh's SOH_Anchor_* exports)

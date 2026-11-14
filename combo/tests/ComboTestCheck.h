@@ -21,3 +21,4 @@ inline int gChecks = 0;
 // One entry point per test file, all run by ComboAnchorTestsMain.cpp.
 void RunOutboxTests();
 void RunDeliveryTests();
+void RunMmFlagTests();
