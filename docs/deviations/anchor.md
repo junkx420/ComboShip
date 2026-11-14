@@ -685,3 +685,76 @@ ids, `SeenIds`, queue filter, ack mark, `InFlight`, the request gate), same `com
   are deleted after 5 minutes without activity anyway. With requests serialized and the queue no longer
   tied to the state shape, the remaining loss is "the other game's *stored* state while no teammate is
   online", which the next both-online resync repairs.
+
+## Co-op next, block 3: MM flag sync (2026-11-14)
+
+**Why:** MM shared items but no world state ("Flag sync intentionally deferred" since phase 2c): a
+teammate's opened chest, pressed switch, activated owl statue or notebook entry only arrived with a
+full team-state resync — and, as it turned out, not even then (see the two resync fixes below).
+
+**What is shared — and what is not.** MM resets most of its world with every Song of Time, and each
+player runs their own three-day cycle. So the rule is the game's own: *only what survives a cycle
+reset* (`Sram_SaveEndOfCycle`, `mm/src/code/z_sram_NES.c`).
+
+| State | Shared | Reason |
+|---|---|---|
+| Chest flags inside the scene's persistent mask (`sPersistentCycleSceneFlags[scene].chest`) | yes | kept across the reset |
+| Switch flags 0..63 inside the persistent mask (`switch0` / `switch1`) | yes | kept across the reset |
+| Collectible flags 1..31 inside the persistent mask | yes | kept across the reset |
+| `weekEventReg` bits marked persistent (`sPersistentCycleWeekEventRegs`), incl. the Bombers' Notebook entries (`gBombersNotebookWeekEventFlags` are weekEventReg flags) | yes | kept across the reset |
+| Owl statue activations (`playerData.owlActivationFlags`, statues 0..9) | yes | never reset |
+| Masks, items, songs, upgrades | (already) | `GIVE_ITEM` + team-state merge |
+| Chest / switch / collectible flags outside the persistent mask | no | cleared by the reset |
+| Cleared-room flags | no | cleared by the reset (`clearedRoom = 0`) |
+| Temporary switches 64..127, collectibles 32..127 | no | never saved |
+| Non-persistent `weekEventReg` bits, the horse-race state | no | this player's three days |
+| `eventInf` | no | cleared by the reset |
+| `randoInf` | no (unchanged) | OR-merged by the team-state resync only |
+
+Flags are only ever **set**, never cleared, like the team-state merge ("a resync can only add"). That
+makes every replay (outbox, server queue, re-send) harmless.
+
+**Wire:** new packet `COMBO_MM_FLAG { kind, scene, flag }`, `addToQueue`, team-scoped. `kind` is
+`chest` / `switch` / `collectible` (scene = index into `cycleSceneFlags`, flag = the game's flag id),
+`weekEventReg` (flag = `(index << 8) | mask`) or `owl` (flag = statue id). Its own type rather than
+`SET_FLAG`: packets replayed from the server's team queue reach both games past their origin filters,
+and OOT's `SET_FLAG` handler must never see an MM flag. Older builds ignore the unknown type. The
+launcher treats it like the other save-affecting packets (`IsDurablePacketType`): held while offline,
+stamped with a packet id, acknowledged.
+
+**MM (`mm/2s2h/Network/Anchor/MMAnchor.{h,cpp}`, combo-owned; no vendored edit):**
+- **Send.** `OnSceneFlagSet` / `OnFlagSet` hooks (they fire on a real off -> on change) filter by the
+  game's persistence tables. Those tables are plain globals in `z_sram_NES.c` without a header, so
+  `MMAnchor.cpp` declares them `extern` with the same layout. Owl statues are set by a bare macro
+  (`SET_OWL_STATUE_ACTIVATED`), so `PollOwlStatues` compares the flags once per frame instead; the
+  baseline is retaken, announcing nothing, whenever no save is in play, after a team-state merge and
+  after a remote flag.
+- **Receive** (`HandlePacket_MmFlag`, foreground and dormant). Every value is re-validated against this
+  client's own persistence tables, so a packet can never set a cycle-bound flag. Scene flags go through
+  `ApplyPersistentSceneBits`: the working copy (`cycleSceneFlags`), the Save (`permanentSceneFlags`)
+  and, in the foreground, the live scene (`actorCtx.sceneFlags`) when the player is in that scene.
+  Written directly, never through `Flags_Set*`: the rando marks a check `eligible` from those hooks and
+  would grant the teammate's check again; the item itself arrives through `GIVE_ITEM`, which also marks
+  the check obtained. Dormant applies persist through the existing `dormantDidApply` save.
+
+**Two resync defects fixed on the way (same files):**
+- *Receiver.* `HandlePacket_UpdateTeamState` OR-merged scene flags into `permanentSceneFlags` only. The
+  game loads `cycleSceneFlags` from the Save once and copies it back over `permanentSceneFlags` on
+  every save, so the merged flags were invisible in the running session and erased by the next save.
+  The persistent part is now also applied to the working copy and the live scene.
+  `owlActivationFlags` is OR-merged as well (the `playerData` replace could deactivate a statue).
+- *Sender.* `SendTeamStateFromSave` serialized `gSaveContext.save`, whose scene flags are as old as the
+  last save. It now sends a copy with the persistent flags of the working copy and the live scene
+  overlaid (`OverlayPersistentSceneFlags`).
+
+**Tests:** `combo/net/ComboAnchorMmFlags.h` holds the packet vocabulary and the bit rules;
+`combo/tests/ComboAnchorMmFlagsTest.cpp` covers the weekEventReg persistence mask, the flag-id ranges
+and that the launcher holds the packet.
+
+**Limits / not covered:**
+- Same-room visuals: an actor that is already spawned (a closed chest, a switch) does not react to a
+  remote flag; it is correct after the next room or scene load. OOT has per-actor hooks for this.
+- Nothing is ever un-set: a persistent switch a teammate turns off again stays on for the others.
+- Persistent `weekEventReg` bits are world progress by the game's own definition; a teammate's
+  one-time event (an NPC reward, a notebook entry) therefore counts as done for the team.
+- No sync while MM has no loaded rando save, and none in rooms with item sync off.
